@@ -1,0 +1,2286 @@
+==================================================
+.\simulation\action_transformer.py
+==================================================
+# ./simulation/action_transformer.py
+
+import polars as pl
+import warnings
+from .hierarchy import ActionHierarchy
+
+# For now, let's keep the transformed action prefix blank; the columns are thus names after the leaf nodes of the action hierarchy
+prefix = ""
+
+
+def transform_actions(
+    actions_series: pl.Series, action_hierarchy: ActionHierarchy
+) -> pl.DataFrame:
+    """
+    Transforms a Series of chosen action names into a DataFrame of binary
+    features representing all active nodes in the action hierarchy for each customer.
+
+    An action hierarchy node A_j is active for a chosen action A_chosen (which
+    must be one of the keys in action_hierarchy.costs) if A_chosen is a
+    descendant of A_j in the hierarchy (including A_j itself).
+    This is equivalent to checking if A_j is an ancestor of A_chosen.
+
+    The columns for the root node(s) and the 'NoAction' node are EXCLUDED
+    from the output DataFrame. 'NoAction' is implicitly represented by a row
+    of all zeros in the remaining columns (if 'NoAction' is an actionable node).
+
+    Args:
+        actions_series: A Polars Series where each row is the chosen action name.
+                        Shape (|N|,). Assumes values are potentially valid keys in action_hierarchy.costs
+                        or 'NoAction' or other strings.
+        action_hierarchy: The ActionHierarchy object.
+
+    Returns:
+        A Polars DataFrame. Shape (|N|, |ActionHierarchyNodes| - |Roots| - |NoAction node|).
+        Columns correspond to nodes in the hierarchy (excluding root(s) and NoAction),
+        prefixed with '{prefix}'. Value is 1 if the node is active, 0 otherwise.
+    """
+    # Get the root node(s). Assuming single root or treating all as roots to exclude.
+    root_nodes_to_exclude = action_hierarchy.get_roots()
+
+    # Identify the 'NoAction' node name to exclude if it exists and is actionable
+    noaction_node_to_exclude = "NoAction"
+
+    # Get all possible nodes in the action hierarchy
+    all_hierarchy_nodes = action_hierarchy.get_all_nodes()
+
+    # Determine which nodes should become columns in the output DataFrame
+    output_nodes = sorted(
+        [
+            node
+            for node in all_hierarchy_nodes
+            if node not in root_nodes_to_exclude and node != noaction_node_to_exclude
+        ]
+    )
+
+    # If after removing nodes, no columns are left, handle empty DF case
+    if not output_nodes or actions_series.len() == 0:
+        column_order = [
+            f"{prefix}{node}" for node in output_nodes
+        ]  # Still define potential columns
+        schema = {col: pl.UInt8 for col in column_order}
+        return pl.DataFrame(schema=schema)
+
+    # Ensure the input series has a name for use in expressions
+    input_series_name = actions_series.name
+    if input_series_name is None:
+        input_series_name = "chosen_action_input"
+        actions_series = actions_series.alias(input_series_name)
+    # else: use existing actions_series.name
+
+    # Get actionable nodes (those with defined costs). These are the actual actions that can be "chosen".
+    actionable_nodes = set(action_hierarchy.costs.keys())
+
+    # --- Input Validation ---
+    # Filter the series directly using Series methods to find invalid actions
+    invalid_actions_series = actions_series.filter(
+        ~actions_series.is_in(list(actionable_nodes))
+    )
+    invalid_actions = invalid_actions_series.unique().to_list()
+
+    if invalid_actions:
+        invalid_actions_clean = [
+            action for action in invalid_actions if action is not None
+        ]
+        if invalid_actions_clean:
+            warnings.warn(
+                f"Input series contains action names not defined in action_hierarchy.costs: {invalid_actions_clean}. Rows with these actions will result in all zero features in the output columns."
+            )
+
+    # Pre-calculate descendants for all hierarchy nodes.
+    # We need this to check if the *chosen* action is a descendant of a given node (which means the node is active).
+    # This calculation must include root/NoAction nodes if they are in the hierarchy, as chosen actions
+    # might be descendants of them.
+    node_descendants_map = {
+        node: action_hierarchy.get_descendants(node)
+        for node in all_hierarchy_nodes  # Use all nodes for this calculation
+    }
+
+    # Create expressions for each node that should become an output column
+    expressions = []
+    # Iterate *only* over the nodes we want as output columns
+    for node in output_nodes:
+        # Get the set of descendants for this 'node' from the pre-calculated map
+        node_descendants = node_descendants_map.get(node, set())  # Use .get for safety
+
+        # Filter these descendants to include only those that are actionable (can be chosen)
+        descendant_actionable_actions = [
+            d for d in node_descendants if d in actionable_nodes
+        ]
+
+        # The column value for 'A_node' is 1 if the chosen action (value in actions_series for a row)
+        # is present in the list of `descendant_actionable_actions` for this 'node'.
+        expr = (
+            pl.col(input_series_name)
+            .is_in(descendant_actionable_actions)
+            .cast(pl.UInt8)  # Cast boolean to 0/1
+            .alias(f"{prefix}{node}")
+        )
+        expressions.append(expr)
+
+    # Apply all expressions to the input series by wrapping it in a DataFrame
+    actions_df_temp = pl.DataFrame({input_series_name: actions_series})
+
+    # Use select with the defined expressions. This creates the new columns
+    # and naturally excludes the original series column and any other columns
+    # not included in the expressions list.
+    hierarchical_actions_df = actions_df_temp.select(expressions)
+
+    # Ensure columns are in the sorted order of output_nodes for consistency.
+    column_order = [f"{prefix}{node}" for node in output_nodes]
+
+    # Check if the generated columns match the expected ones.
+    if set(hierarchical_actions_df.columns) != set(column_order):
+        missing_cols = set(column_order) - set(hierarchical_actions_df.columns)
+        extra_cols = set(hierarchical_actions_df.columns) - set(column_order)
+        warnings.warn(
+            f"Generated hierarchical columns do not match expected. Missing: {missing_cols}, Extra: {extra_cols}"
+        )
+
+    # Reorder columns using select to match the consistent order.
+    # This will also error if a column is in column_order but wasn't generated, which is good.
+    hierarchical_actions_df = hierarchical_actions_df.select(column_order)
+
+    return hierarchical_actions_df.cast(pl.UInt8)  # Final cast to binary
+
+
+def transform_actions_to_series(
+    hierarchical_actions_df: pl.DataFrame, action_hierarchy: ActionHierarchy
+) -> pl.Series:
+    """
+    Transforms a DataFrame of binary hierarchical action features (EXCLUDING
+    root and NoAction columns) back into a Series of chosen action names.
+
+    It infers the chosen action based on the pattern of activated nodes in the
+    provided columns. If a row is all zeros across the provided actionable node
+    columns, it is mapped to 'NoAction', provided 'NoAction' is defined as
+    an actionable node (has a cost). Otherwise, it maps to the unique actionable
+    node whose column is 1, prioritizing alphabetically if multiple match.
+    If no matching actionable node is found (e.g., row of zeros but NoAction
+    not actionable, or pattern doesn't match any single actionable node),
+    the result is None for that row.
+
+    Args:
+        hierarchical_actions_df: A Polars DataFrame. Shape (|N|, |Subset of HierarchyNodes|).
+                                 Columns correspond to nodes (excluding root(s) and NoAction),
+                                 prefixed with '{prefix}'. Values are binary (0 or 1).
+        action_hierarchy: The ActionHierarchy object.
+
+    Returns:
+        A Polars Series. Shape (|N|,). Values are the original chosen action names (strings)
+        or None if a unique actionable action cannot be determined for a row based on the remaining columns.
+    """
+    # Use .height to get the number of rows in a DataFrame
+    if hierarchical_actions_df.height == 0:
+        return pl.Series("chosen_action", [], dtype=pl.String)
+
+    # Get all nodes considered actionable (those with defined costs)
+    actionable_nodes = sorted(list(action_hierarchy.costs.keys()))
+
+    # Identify the 'NoAction' node name
+    noaction_node = "NoAction"
+
+    # Identify the actionable nodes *other than* NoAction
+    other_actionable_nodes = [
+        node for node in actionable_nodes if node != noaction_node
+    ]
+
+    # Identify the columns in the input DataFrame that correspond to these other actionable nodes
+    other_actionable_cols_in_df = [
+        f"{prefix}{node}"
+        for node in other_actionable_nodes
+        if f"{prefix}{node}" in hierarchical_actions_df.columns
+    ]
+
+    # Build the core expression chain
+    # Default value if no action is matched
+    reverse_expr = pl.lit(None, dtype=pl.String)
+
+    # --- Logic for inferring 'NoAction' ---
+    # If 'NoAction' is an actionable node (i.e., has a cost) AND
+    # if all columns corresponding to *other* actionable nodes in the DF are 0.
+    # Summing the relevant columns is an efficient way to check if they are all zero.
+    # Start with a false condition, will update if NoAction is actionable.
+    is_noaction_condition = pl.lit(False)
+
+    if (
+        noaction_node in actionable_nodes
+    ):  # Can only map to NoAction if it's a defined actionable action
+        if other_actionable_cols_in_df:
+            # Sum the columns corresponding to other actionable nodes present in the DF
+            sum_of_other_actionable_cols = sum(
+                pl.col(c) for c in other_actionable_cols_in_df
+            )
+            # The condition is when this sum is zero
+            is_noaction_condition = sum_of_other_actionable_cols == 0
+        elif hierarchical_actions_df.width > 0:
+            # If there are no other actionable columns in the DF, but the DF has columns,
+            # check if the entire row is zero by summing all columns present.
+            sum_all_cols_in_df = sum(pl.col(c) for c in hierarchical_actions_df.columns)
+            is_noaction_condition = sum_all_cols_in_df == 0
+        else:
+            # If the DataFrame has no columns (width is 0), then the 'sum' is implicitly 0.
+            # If NoAction is actionable, and there are no other actionable columns to check,
+            # assume an empty/all-zero row maps to NoAction. This handles edge cases like
+            # only NoAction being actionable and its column was removed.
+            is_noaction_condition = pl.lit(
+                True
+            )  # Row is effectively all zeros relevant to other actions
+
+        # If the condition is met, map to 'NoAction'. This is the highest priority mapping.
+        reverse_expr = (
+            pl.when(is_noaction_condition)
+            .then(pl.lit(noaction_node))
+            .otherwise(reverse_expr)
+        )
+
+    # --- Logic for mapping to other actionable nodes ---
+    # Iterate through the other actionable nodes whose columns are present in the DataFrame
+    # Process them in sorted alphabetical order for deterministic mapping
+    mappable_other_actionable_nodes = sorted(
+        [
+            node
+            for node in other_actionable_nodes
+            if f"{prefix}{node}" in hierarchical_actions_df.columns
+        ]
+    )
+
+    for action_name in mappable_other_actionable_nodes:
+        col_name = f"{prefix}{action_name}"
+        # Add a condition: if this action's column is 1, map to this action name
+        # This is chained after the NoAction check
+        reverse_expr = (
+            pl.when(pl.col(col_name) == 1)
+            .then(pl.lit(action_name))
+            .otherwise(reverse_expr)
+        )
+
+    # Apply the final expression to get the series of chosen actions
+    chosen_action_series = hierarchical_actions_df.select(
+        reverse_expr.alias("chosen_action")
+    )["chosen_action"]
+
+    # Check for rows that couldn't be mapped (still None)
+    if chosen_action_series.is_null().any():
+        num_unmapped = chosen_action_series.is_null().sum()
+        warnings.warn(
+            f"{num_unmapped} row(s) could not be mapped back to a chosen action (result is None). Check input DataFrame structure or hierarchy/costs configuration. This may happen if the row's pattern of 0s/1s doesn't match the expected pattern for any single actionable node (e.g., multiple actionable leaves are marked 1, or the row is all zeros when NoAction is not actionable)."
+        )
+
+    return chosen_action_series
+--------------------------------------------------
+
+==================================================
+.\simulation\config.py
+==================================================
+# config.py
+
+# --- Simulation Parameters ---
+SIMULATION_CONFIG = {
+    "N_CUSTOMERS": 10000,  # Number of customers
+    "N_SIMULATION_STEPS": 10,  # Number of time steps to simulate
+    # Product ownership regime:
+    # 'single': Customer can own only one instance, ownership persists.
+    # 'count': Customer can own multiple instances, purchase increments count.
+    "PRODUCT_OWNERSHIP_REGIME": "single",  # or 'count'
+    # --- Customer Features (X) ---
+    # Define the structure and initial distribution of customer features.
+    "CUSTOMER_FEATURES_X": {
+        "continuous": ["age", "income"],
+        "categorical": {
+            "customer_type": ["type_A", "type_B", "type_C"],
+            "region": ["north", "south", "east", "west"],
+        },
+        "binary": ["is_prime_member"],
+    },
+    "CUSTOMER_FEATURES_CATEGORICAL_LEVELS_TO_DROP": {
+        "customer_type": "type_A",
+        "region": "north",
+    },
+    # --- Product Hierarchy (B) ---
+    # Define the hierarchy as a list of (parent, child) tuples.
+    "PRODUCT_HIERARCHY": [
+        ("AllProducts", "HotBeverages"),
+        ("AllProducts", "ColdBeverages"),
+        ("HotBeverages", "Coffee"),
+        ("HotBeverages", "Tea"),
+        ("ColdBeverages", "IcedTea"),
+        ("ColdBeverages", "Water"),
+        ("ColdBeverages", "Cola"),
+    ],
+    # Rewards for purchasing leaf products
+    "PRODUCT_REWARDS": {
+        "Coffee": 5.0,
+        "Tea": 4.0,
+        "IcedTea": 3.0,
+        "Water": 2.0,
+        "Cola": 6.0,
+    },
+    # --- Action Hierarchy (A) ---
+    # Define the hierarchy as a list of (parent, child) tuples.
+    "ACTION_HIERARCHY": [
+        (
+            "NoAction",
+            "NoAction",
+        ),  # Represents the identity action, needs to be in graph
+        ("AllActions", "Group_HotBeverage"),
+        ("AllActions", "Group_ColdBeverage"),
+        ("Group_HotBeverage", "Marketing_Coffee"),
+        ("Group_HotBeverage", "Marketing_Tea"),
+        ("Group_ColdBeverage", "Marketing_IcedTea"),
+        ("Group_ColdBeverage", "Marketing_Water"),
+        ("Group_ColdBeverage", "Marketing_Cola"),
+    ],
+    # Costs for taking leaf actions
+    "ACTION_COSTS": {
+        "NoAction": 0.0,  # Cost of not taking an action
+        "Marketing_Coffee": 0.5,
+        "Marketing_Tea": 0.4,
+        "Marketing_IcedTea": 0.3,
+        "Marketing_Water": 0.2,
+        "Marketing_Cola": 0.6,
+    },
+    # --- Ground Truth Model Weights ---
+    "GROUND_TRUTH_WEIGHTS": {
+        "Coffee": {
+            "intercept": -4,
+            "X": {"customer_type_B": 0.9, "region_east": -0.8},
+            "A": {
+                "Marketing_Coffee": 0.70,
+                "Group_HotBeverage": 0.50,
+            },
+            "interaction": {
+                "Marketing_Coffee_x_region_west": -0.7,
+                "Group_HotBeverage_x_region_west": 0.11,
+            },
+        },
+        "Tea": {
+            "intercept": -4,
+            "X": {"income": 0.40, "region_south": 0.40, "region_west": -0.80},
+            "A": {"Marketing_Tea": 0.65, "Group_HotBeverage": 0.66},
+            "interaction": {"Marketing_Tea_x_age": -0.20},
+        },
+        "IcedTea": {
+            "intercept": -5,
+            "X": {"region_south": -0.6, "is_prime_member": -0.75},
+            "A": {
+                "Group_ColdBeverage": 0.12,
+                "Marketing_Tea": 0.30,
+                "Marketing_IcedTea": 0.30,
+            },
+            "interaction": {
+                "Group_ColdBeverage_x_is_prime_member": 0.30,
+                "IcedTea_x_region_west": 0.30,
+            },
+        },
+        "Water": {
+            "intercept": -6,
+            "X": {
+                "is_prime_member": 0.87,
+                "region_east": -0.60,
+                "customer_type_C": 0.80,
+            },
+            "A": {
+                "Marketing_Coffee": -0.2,
+                "Marketing_Tea": -0.3,
+                "Marketing_Water": 1.4,
+                "Group_ColdBeverage": 0.20,
+            },
+            "interaction": {},
+        },
+        "Cola": {
+            "intercept": -5,
+            "X": {"customer_type_C": 0.7, "region_east": -0.88, "region_west": -0.50},
+            "A": {"Group_HotBeverage": -0.97, "Marketing_Cola": 1.5},
+            "interaction": {
+                "Marketing_Cola_x_age": -0.26,
+                "Group_HotBeverage_x_region_west": 0.35,
+            },
+        },
+    },
+    # --- Initial Population State (B_0) ---
+    "INITIAL_PRODUCT_OWNERSHIP_PROBS": {
+        "Coffee": 0.1,
+        "Tea": 0.05,
+        "Water": 0.2,
+    },
+    # --- Initial Eligibility Ruling---
+    # These probabilities describe the probability of being eligible for a marketing campaign
+    # In the real world, there would be a connection to X, but we simulate random eligibility here for simplicity
+    # In the real world, the eligibility would (hopefully) also be tackled by the IPW model
+    "INITIAL_ELIGIBILITY_PROBS": {
+        "NoAction": 1.0,
+        "Marketing_Coffee": 0.93,
+        "Marketing_Tea": 0.95,
+        "Marketing_IcedTea": 0.91,
+        "Marketing_Water": 0.97,
+        "Marketing_Cola": 0.88,
+    },
+}
+--------------------------------------------------
+
+==================================================
+.\simulation\engine.py
+==================================================
+# engine.py
+
+import polars as pl
+import numpy as np
+import warnings
+import matplotlib.pyplot as plt
+from .population import Population
+from .policy import Policy
+from .ground_truth import calculate_rewards, calculate_total_reward
+
+
+class Engine:
+    def __init__(self, population: Population, choosing_policy: Policy):
+        self.population = population
+        self.choosing_policy = choosing_policy
+        self.rewards = []  # Changed to a list to append rewards easily
+
+    def evolve(self, n_steps=25):
+        """Evolve the population n_steps using the specified choosing policy"""
+        print(
+            f"Starting simulation for {n_steps} steps with {type(self.choosing_policy).__name__}."
+        )
+        for t in range(n_steps):
+            print(f"Simulating step {t+1}/{n_steps}...")
+
+            # 2. Policy makes a choice based on the current state
+            # The policy's choose method should return a Polars Series of chosen action names
+            chosen_actions_series = self.choosing_policy.choose(self.population)
+
+            # 3. Update the population's state with the chosen actions
+            self.population.update_state_with_actions(chosen_actions_series)
+
+            # 4. Simulate the outcome of this choice for the next time step
+            # This function now encapsulates the calculation of logits, probabilities,
+            # and the Bernoulli draw, updating the product possession state internally.
+            # It returns the binary outcome for the current time step.
+            product_outcome_df = self.population.simulate_product_possession_outcome(
+                seed=t,  # Use time step as seed for reproducibility of each step
+            )
+
+            # print(product_outcome_df[0:5, :])
+
+            # 5. Extract and collect the reward generated by our choice
+            # Calculate rewards based on the product_outcome_df (binary 0/1 purchases)
+            individual_rewards = calculate_rewards(
+                product_outcome_df, self.population.config
+            ).alias("rewards")
+
+            # print(individual_rewards[0:5])
+
+            total_reward_this_step = calculate_total_reward(individual_rewards)
+            self.rewards.append(total_reward_this_step)
+            print(f"Step {t+1} completed. Total reward: {total_reward_this_step:.2f}")
+
+        print("Simulation complete.")
+
+    def plot_rewards(self):
+        """Plot the accumulated reward each time step"""
+        if not self.rewards:
+            print("No rewards to plot. Run the evolve method first.")
+            return
+
+        plt.figure(figsize=(10, 6))
+        plt.plot(
+            range(1, len(self.rewards) + 1), self.rewards, marker="o", linestyle="-"
+        )
+        plt.title(f"Total Reward Over Time ({type(self.choosing_policy).__name__})")
+        plt.xlabel("Simulation Step")
+        plt.ylabel("Total Reward")
+        plt.grid(True)
+        plt.show()
+
+    def get_population_state(self) -> pl.DataFrame:
+        """
+        Returns the state of the population DataFrame after N simulation steps.
+        """
+        return self.population.get_state()
+
+    def get_population(self) -> Population:
+        """
+        Returns the population DataFrame after N simulation steps.
+        """
+        return self.population
+--------------------------------------------------
+
+==================================================
+.\simulation\ground_truth.py
+==================================================
+import random
+import polars as pl
+import numpy as np
+from typing import Dict, Any
+
+
+def create_ground_truth_weights(features_X, marketing_actions_A, products_B):
+    """
+    Creates a dictionary with ground truth weights for each product.
+    """
+    ground_truth_weights = {"GROUND_TRUTH_WEIGHTS": {}}
+
+    for product in products_B:
+        product_weights = {
+            "intercept": round(random.uniform(-5.0, 5.0), 2),
+            "X": {},
+            "A": {},
+            "interaction": {},
+        }
+
+        # Randomly select a few features from X and assign weights
+        selected_x_features = random.sample(
+            features_X, min(len(features_X), random.randint(2, 4))
+        )
+        for feature in selected_x_features:
+            product_weights["X"][feature] = round(random.uniform(-1.0, 1.0), 2)
+
+        # Randomly select a few marketing actions from A and assign weights
+        selected_a_actions = random.sample(
+            marketing_actions_A, min(len(marketing_actions_A), random.randint(1, 3))
+        )
+        for action in selected_a_actions:
+            product_weights["A"][action] = round(random.uniform(-1.0, 2.0), 2)
+
+        # Randomly select a few interactions between A and X and assign weights
+        num_interactions = random.randint(0, 2)
+        for _ in range(num_interactions):
+            random_action = random.choice(marketing_actions_A)
+            random_feature = random.choice(features_X)
+            interaction_name = f"{random_action}_x_{random_feature}"
+            product_weights["interaction"][interaction_name] = round(
+                random.uniform(-1.0, 1.0), 2
+            )
+
+        ground_truth_weights["GROUND_TRUTH_WEIGHTS"][product] = product_weights
+    return ground_truth_weights
+
+
+def create_ground_truth_function(simulation_config: Dict[str, Any]):
+    """
+    Creates a closure that calculates ground truth values for each product.
+
+    Args:
+        simulation_config (dict): The dictionary containing ground truth weights.
+
+    Returns:
+        function: A function `ground_truth(df)` that takes a Polars DataFrame of the
+                  expanded population state and returns a new Polars DataFrame
+                  with ground truth columns.
+    """
+    product_weights = simulation_config["GROUND_TRUTH_WEIGHTS"]
+
+    def ground_truth(df: pl.DataFrame) -> pl.DataFrame:
+        output_exprs = []
+
+        for product, weights in product_weights.items():
+            # Start with the intercept for the product column expression
+            # Use pl.lit() to create a literal series, then scale it
+            product_expr = pl.lit(weights["intercept"], dtype=pl.Float32)
+
+            # Add weights for X features
+            for feature, weight in weights["X"].items():
+                if feature in df.columns:
+                    product_expr = product_expr + (pl.col(feature) * weight)
+
+            # Add weights for A actions
+            for action, weight in weights["A"].items():
+                if action in df.columns:
+                    product_expr = product_expr + (pl.col(action) * weight)
+
+            # Add weights for interaction terms
+            for interaction_name, weight in weights["interaction"].items():
+                parts = interaction_name.split("_x_")
+                if len(parts) == 2:
+                    action, feature = parts[0], parts[1]
+                    if action in df.columns and feature in df.columns:
+                        product_expr = product_expr + (
+                            pl.col(action) * pl.col(feature) * weight
+                        )
+
+            output_exprs.append(
+                product_expr.alias(product)
+            )  # Alias the expression with the product name
+
+        # Select all computed expressions to form the new DataFrame
+        return df.select(output_exprs)
+
+    return ground_truth
+
+
+def calculate_probabilities_from_logits(logits_df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Calculates the probabilities for each cell in the input DataFrame
+    using the sigmoid function on logit scores.
+
+    Args:
+        df: A Polars DataFrame where each column contains logit scores (f64).
+
+    Returns:
+        A Polars DataFrame of the same shape, containing probabilities (f64)
+        between 0 and 1.
+    """
+
+    # Define the sigmoid function as a UDF (User Defined Function) for Polars
+    # The sigmoid function converts logit scores to probabilities: P = e^s / (1 + e^s)
+    def sigmoid_udf(s: pl.Series) -> pl.Series:
+        return pl.Series(np.exp(s) / (1 + np.exp(s)))
+
+    # Apply the sigmoid function to all columns to convert logits to probabilities.
+    # We use a list comprehension with pl.col(col).map_batches() for efficiency
+    # across each column, ensuring the operation is applied element-wise.
+    prob_df = logits_df.with_columns(
+        [pl.col(col).map_batches(sigmoid_udf) for col in logits_df.columns]
+    )
+    return prob_df
+
+
+def sample_bernoulli_from_probabilities(
+    prob_df: pl.DataFrame, seed: int | None = None
+) -> pl.DataFrame:
+    """
+    Samples a binary (0, 1) draw for each observation based on the provided
+    probabilities.
+
+    Args:
+        prob_df: A Polars DataFrame where each column contains probabilities (f64)
+                 between 0 and 1.
+        seed: An optional integer seed for reproducibility. If None, no seed
+              is set, and results will vary with each run.
+
+    Returns:
+        A Polars DataFrame of the same shape, containing only 0s and 1s,
+        representing the binary (Bernoulli) draws.
+    """
+    if seed is not None:
+        # Set the seed for NumPy's global random state to ensure reproducibility.
+        np.random.seed(seed)
+
+    # Generate a DataFrame of random uniform numbers between 0 and 1.
+    # The shape of this DataFrame matches the input prob_df.
+    random_draws_df = pl.DataFrame(
+        {col: np.random.rand(len(prob_df)) for col in prob_df.columns}
+    )
+
+    # Compare the random draws with the probabilities to get binary outcomes.
+    # If a random draw is less than the corresponding probability, the outcome is 1 (success),
+    # otherwise it's 0 (failure).
+    # .cast(pl.UInt8) converts the boolean result (True/False) to 1/0.
+    binary_df = (random_draws_df < prob_df).cast(pl.UInt8)
+
+    return binary_df
+
+
+def calculate_rewards(results: pl.DataFrame, simulation_config: Dict):
+    reward_df = pl.DataFrame(
+        {
+            col: results[col].cast(pl.Float32)
+            * simulation_config["PRODUCT_REWARDS"][col]
+            for col in results.columns
+        }
+    )
+
+    # Sum across each row to give the reward or expected reward of an individual
+    return reward_df.sum_horizontal()
+
+
+def calculate_total_reward(reward_df):
+    # Sum all individual rows to get the total reward of a population
+    return reward_df.sum()
+--------------------------------------------------
+
+==================================================
+.\simulation\hierarchy.py
+==================================================
+# hierarchy.py
+
+import networkx as nx
+
+# Import pyplot here for the plot method, but handle potential ImportError
+import matplotlib.pyplot as plt
+import warnings  # Import warnings module
+
+
+class Hierarchy:
+    """Base class for Product and Action Hierarchies."""
+
+    def __init__(self, edges):
+        self.graph = nx.DiGraph()
+        # Handle empty edges list
+        if edges:
+            self.graph.add_edges_from(edges)
+
+        # Ensure all nodes are added even if they are only roots/parents
+        all_nodes = set()
+        if edges:
+            for parent, child in edges:
+                all_nodes.add(parent)
+                all_nodes.add(child)
+        # If edges is empty, there might still be nodes intended, but we can't know.
+        # Assume nodes must be present in edges for now.
+        self.graph.add_nodes_from(all_nodes)
+
+        # Find roots (nodes with no parents)
+        self.roots = sorted(
+            [node for node, degree in self.graph.in_degree() if degree == 0]
+        )
+        # Find leaves (nodes with no children)
+        self.leaves = sorted(
+            [node for node, degree in self.graph.out_degree() if degree == 0]
+        )
+        # Non-leaf nodes are all nodes minus the leaves
+        self.non_leaves = sorted(
+            [node for node in self.graph.nodes() if node not in self.leaves]
+        )
+        # All nodes in a defined order
+        self.all_nodes = sorted(
+            list(self.graph.nodes())
+        )  # Sort for consistent column ordering later
+
+        if not self.roots and self.graph.number_of_nodes() > 0:
+            warnings.warn(
+                "No root nodes found in hierarchy. This might indicate a cycle or a disconnected graph."
+            )
+        if not self.leaves and self.graph.number_of_nodes() > 0:
+            warnings.warn(
+                "No leaf nodes found in hierarchy. This might indicate a cycle or nodes with only outgoing edges."
+            )
+        if len(self.roots) > 1:
+            warnings.warn(
+                f"Multiple root nodes found: {self.roots}. Hierarchies are typically single-rooted."
+            )
+
+    def get_all_non_root_nodes(self):
+        """
+        Returns a list of all node names in the hierarchy as strings,
+        excluding the root node(s).
+        """
+        # Get all nodes and convert to a set for efficient difference calculation
+        all_nodes_set = set(self.get_all_nodes())
+        # Get root nodes and convert to a set
+        root_nodes_set = set(self.get_roots())
+
+        # Calculate the difference to get non-root nodes
+        non_root_nodes = all_nodes_set - root_nodes_set
+
+        # Convert to a list and sort for consistent order
+        return sorted(list(non_root_nodes))
+
+    def get_all_nodes(self):
+        """Returns a list of all nodes in the hierarchy."""
+        return self.all_nodes
+
+    def get_leaves(self):
+        """Returns a list of leaf nodes in the hierarchy."""
+        return self.leaves
+
+    def get_non_leaves(self):
+        """Returns a list of non-leaf nodes in the hierarchy."""
+        return self.non_leaves
+
+    def get_roots(self):
+        """Returns a list of root nodes in the hierarchy."""
+        return self.roots
+
+    def get_ancestors(self, node):
+        """Returns a set of ancestors for a given node (including the node itself)."""
+        if node not in self.graph:
+            return set()
+        # nx.ancestors includes all nodes reachable by traversing edges backwards
+        ancestors = nx.ancestors(self.graph, node)
+        ancestors.add(node)  # Include the node itself
+        return ancestors
+
+    def get_descendants(self, node):
+        """Returns a set of descendants for a given node (including the node itself)."""
+        if node not in self.graph:
+            return set()
+        # nx.descendants includes all nodes reachable by traversing edges forwards
+        descendants = nx.descendants(self.graph, node)
+        descendants.add(node)  # Include the node itself
+        return descendants
+
+    def __repr__(self):
+        """Provides a concise string representation of the hierarchy."""
+        num_nodes = len(self.graph.nodes())
+        num_edges = len(self.graph.edges())
+        roots_str = ", ".join(self.roots) if self.roots else "None"
+        leaves_str = ", ".join(self.leaves) if self.leaves else "None"
+        return (
+            f"{self.__class__.__name__}(Nodes: {num_nodes}, Edges: {num_edges}, "
+            f"Roots: [{roots_str}], Leaves: [{leaves_str}])"
+        )
+
+    def plot(self, layout=None, ax=None, **kwargs):
+        """
+        Plots the hierarchy graph using networkx and matplotlib.
+
+        Args:
+            layout: The networkx layout function to use (e.g., nx.spring_layout, nx.planar_layout).
+                    Defaults to nx.planar_layout if possible, otherwise nx.spring_layout.
+            ax: The matplotlib axes to draw on. If None, a new figure and axes are created.
+            **kwargs: Additional keyword arguments passed to nx.draw.
+        """
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print(
+                "Matplotlib is required for plotting. Please install it (`pip install matplotlib`)."
+            )
+            return
+
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(10, 8))
+            show_plot = True  # Indicate we created the figure and should show it
+        else:
+            show_plot = False  # User provided axes, assume they will show the plot
+
+        if not self.graph or self.graph.number_of_nodes() == 0:
+            print("Hierarchy is empty or has no nodes to plot.")
+            if show_plot:
+                plt.show()
+            return
+
+        # Choose layout
+        if layout is None:
+            try:
+                # Try hierarchical layout if possible (requires graphviz/pygraphviz)
+                # Using planar or spring as default fallback
+                layout = nx.planar_layout(self.graph)
+            except nx.NetworkXException:
+                layout = nx.spring_layout(self.graph)  # Fallback layout
+
+        # Default drawing options
+        default_kwargs = {
+            "with_labels": True,
+            "node_color": "skyblue",
+            "node_size": 2000,
+            "edge_color": "gray",
+            "arrows": True,
+            "ax": ax,
+            "font_size": 10,
+            "node_shape": "o",
+            "arrowstyle": "-|>",  # Nicer arrows
+            "arrowsize": 20,
+        }
+        # Update with user-provided kwargs
+        draw_kwargs = {**default_kwargs, **kwargs}
+
+        nx.draw(self.graph, pos=layout, **draw_kwargs)
+        ax.set_title(f"{self.__class__.__name__} Visualization")
+        plt.tight_layout()  # Adjust layout to prevent labels overlapping
+
+        if show_plot:
+            plt.show()
+
+
+class ProductHierarchy(Hierarchy):
+    """Represents the product hierarchy with associated rewards."""
+
+    def __init__(self, edges, rewards):
+        super().__init__(edges)
+        self.rewards = rewards
+        # Validate rewards against nodes that are intended to be purchasable (those with rewards)
+        defined_rewards = set(rewards.keys())
+        all_graph_nodes = set(self.graph.nodes())
+
+        # Check if all defined rewards correspond to nodes in the graph
+        if not defined_rewards.issubset(all_graph_nodes):
+            unknown_reward_nodes = defined_rewards - all_graph_nodes
+            warnings.warn(
+                f"Rewards defined for nodes not in hierarchy graph: {unknown_reward_nodes}"
+            )
+
+        # Check if all graph leaves have a defined reward
+        # This warning might be noisy if some leaves are just structural but not purchasable
+        # Let's keep it for now but note its limitation.
+        hierarchy_leaves = set(self.get_leaves())
+        leaves_without_rewards = hierarchy_leaves - defined_rewards
+        if leaves_without_rewards:
+            warnings.warn(
+                f"Hierarchy leaves without defined rewards: {leaves_without_rewards}. Defaulting reward to 0.0 for these."
+            )
+        # We don't strictly require defined_rewards == hierarchy_leaves.
+        # Some non-leaf nodes *could* potentially have rewards in a more complex model.
+
+    def get_reward(self, product_node):
+        """Returns the reward for a specific product node.
+        Typically used for leaf nodes with defined rewards."""
+        # Use .get() with a default of 0.0 if the node doesn't have a defined reward
+        # Or if the node doesn't exist in the hierarchy.
+        if product_node not in self.graph:
+            warnings.warn(
+                f"Reward requested for node '{product_node}' not in hierarchy graph. Returning 0.0."
+            )
+            return 0.0
+        return self.rewards.get(product_node, 0.0)
+
+
+class ActionHierarchy(Hierarchy):
+    """Represents the action hierarchy with associated costs."""
+
+    def __init__(self, edges, costs):
+        super().__init__(edges)
+        self.costs = costs
+        # Validate costs against nodes that are intended to be actionable (those with costs)
+        defined_costs = set(costs.keys())
+        all_graph_nodes = set(self.graph.nodes())
+
+        # Check if all defined costs correspond to nodes in the graph
+        if not defined_costs.issubset(all_graph_nodes):
+            unknown_cost_nodes = defined_costs - all_graph_nodes
+            warnings.warn(
+                f"Costs defined for nodes not in hierarchy graph: {unknown_cost_nodes}"
+            )
+
+        # Check if all graph leaves have a defined cost
+        # Similar to ProductHierarchy, this might be noisy.
+        hierarchy_leaves = set(self.get_leaves())
+        leaves_without_costs = hierarchy_leaves - defined_costs
+        if leaves_without_costs:
+            warnings.warn(
+                f"Hierarchy leaves without defined costs: {leaves_without_costs}. Defaulting cost to 0.0 for these."
+            )
+        # We don't strictly require defined_costs == hierarchy_leaves.
+        # 'NoAction' with a self-loop is a prime example of a node with a cost that isn't a leaf.
+
+    def get_cost(self, action_node):
+        """Returns the cost for a specific action node.
+        Typically used for leaf nodes with defined costs, but can include others."""
+        # Use .get() with a default of 0.0 if the node doesn't have a defined cost
+        # Or if the node doesn't exist in the hierarchy.
+        if action_node not in self.graph:
+            warnings.warn(
+                f"Cost requested for node '{action_node}' not in hierarchy graph. Returning 0.0."
+            )
+            return 0.0
+        return self.costs.get(action_node, 0.0)
+--------------------------------------------------
+
+==================================================
+.\simulation\inverse_propensity_weighting.py
+==================================================
+import polars as pl
+import lightgbm as lgb
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import StratifiedKFold  # For calibration
+import numpy as np
+import warnings
+from .population import Population
+
+
+WEIGHT_TRUNCATION_PERCENTILE = (
+    99  # Truncate weights at this percentile (e.g., 99 for 99th percentile)
+)
+
+
+def calculate_treatment_probabilities(population: Population) -> pl.DataFrame:
+
+    x_columns = population.x_columns
+    actions = population.action_hierarchy.get_leaves() + ["NoAction"]
+
+    # Define the model to be fitted
+    lgbm_clf = lgb.LGBMClassifier(
+        objective="multiclass", num_class=len(actions), random_state=42
+    )
+
+    # Wrap the LGBMClassifier with CalibratedClassifierCV
+    # method='isotonic' or 'sigmoid' can be chosen. 'isotonic' generally performs better
+    # if you have enough data, otherwise 'sigmoid' is more robust.
+    calibrated_clf = CalibratedClassifierCV(lgbm_clf, method="isotonic", cv=5)
+
+    # Fit the calibrated propensity model
+    # Convert A_t to numerical labels as LightGBM works with integers for multiclass
+    action_mapping = {label: i for i, label in enumerate(actions)}
+
+    # Convert to pandas for sklearn compatibility
+    df_pandas = population._state.to_pandas()
+    df_pandas["A_t_encoded"] = df_pandas["A_t"].map(action_mapping)
+
+    # Fit the model
+    calibrated_clf.fit(df_pandas[x_columns], df_pandas["A_t_encoded"])
+
+    # Get predicted probabilities for all possible treatments for each observation
+    # predict_proba returns probabilities in the order of classes in the CalibratedClassifierCV
+    # Reconstruct original class order for clarity
+    calibrated_propensity_classes = calibrated_clf.classes_
+
+    # Convert back to original treatment labels ensuring that the order is correct
+    reordered_propensity_classes = [
+        actions[idx] for idx in calibrated_propensity_classes
+    ]
+
+    # Predict the proba scores
+    predicted_probs_array = calibrated_clf.predict_proba(df_pandas[x_columns])
+
+    # Add predicted probabilities to the main DataFrame
+    predicted_probs_df_pl = pl.DataFrame(
+        predicted_probs_array,
+        schema=[
+            f"{c}" for c in reordered_propensity_classes
+        ],  # Use the reordered original treatment names
+    )
+
+    return predicted_probs_df_pl
+
+
+# --- Step 2.1: Incorporate Eligibility and Re-normalize ---
+def calculate_adjusted_treatment_probabilities(population: Population) -> pl.DataFrame:
+    """
+    Adjusts propensity scores based on eligibility and re-normalizes.
+    """
+    treatment_probabilities = calculate_treatment_probabilities(population)
+    eligibility_columns = population._state[population.eligibility_columns]
+
+    actions = population.action_hierarchy.get_leaves() + ["NoAction"]
+
+    # Calculate the adjusted treatment probabilities by multiplying by the eligibility mask and renormalizing
+    for column in actions:
+        treatment_probabilities = treatment_probabilities.with_columns(
+            (
+                treatment_probabilities[column]
+                * eligibility_columns[f"eligibility_{column}"]
+            ).alias(column)
+        )
+
+    row_sum = treatment_probabilities.sum_horizontal().fill_null(1.0)
+
+    treatment_probabilities = treatment_probabilities.with_columns(
+        treatment_probabilities[col] / row_sum
+        for col in treatment_probabilities.columns
+    )
+
+    return treatment_probabilities
+
+
+def calculate_marginal_probabilities(series: pl.Series) -> pl.Series:
+    """
+    Calculates the marginal probability (relative count) of each unique value in a Polars Series.
+
+    Args:
+        series: The input Polars Series.
+
+    Returns:
+        A dictionary of frequencies per category
+    """
+    # Calculate value counts
+    counts = series.to_frame().group_by(series).len()
+
+    # Calculate total number of elements
+    total_elements = len(series)
+
+    results = counts.with_columns(counts["len"] / total_elements)
+
+    return {key: value for key, value in zip(results["A_t"], results["len"])}
+
+
+def calculate_truncated_stabilized_ipw(
+    population: Population,
+    truncation_lower_bound: float = 0.01,  # e.g., 1st percentile or 0.01
+    truncation_upper_bound: float = 0.85,  # e.g., 99th percentile or 0.99
+) -> pl.DataFrame:
+    """
+    Calculates truncated and stabilized inverse propensity weights (IPW).
+
+    Args:
+        population (Population): The Population object containing the state
+                                 with observed actions ('A_t').
+        truncation_lower_bound (float): The lower percentile (e.g., 0.01 for 1st percentile)
+                                        or a fixed minimum value for truncating weights.
+                                        If 0 < truncation_lower_bound < 1, it's treated as a percentile.
+                                        Otherwise, it's a fixed lower bound for the weights.
+        truncation_upper_bound (float): The upper percentile (e.g., 0.99 for 99th percentile)
+                                        or a fixed maximum value for truncating weights.
+                                        If 0 < truncation_upper_bound < 1, it's treated as a percentile.
+                                        Otherwise, it's a fixed upper bound for the weights.
+
+    Returns:
+        pl.DataFrame: A Polars DataFrame with a single column 'IPW' containing
+                      the truncated and stabilized inverse propensity weights.
+    """
+    observed_actions = population._state.select(pl.col("A_t"))
+
+    # Calculate marginal probabilities of each action 'a'
+    marginal_prob_map = calculate_marginal_probabilities(observed_actions)
+
+    # Calculate the treatment probabilities
+    treatment_probabilities = calculate_adjusted_treatment_probabilities(population)
+
+    # Stabilize the calculated treatment probabilites by dividing by the marginal probabilities of each treatment
+    stabilized_treatment_probabilities = treatment_probabilities.with_columns(
+        treatment_probabilities[col] / marginal_prob_map[col]
+        for col in treatment_probabilities.columns
+    )
+
+    # Calculate the clipped IPW by doing 1/probability
+    ipw = stabilized_treatment_probabilities.with_columns(
+        1 / stabilized_treatment_probabilities[col].clip(1e-6, 1e6)
+        for col in stabilized_treatment_probabilities.columns
+    )
+
+    # Apply a clipping to the IPW to truncate to high or low values
+    expressions = []
+    for column in ipw.columns:
+        # Calculate the 1st and 99th quantiles as expressions
+        lower_bound = ipw[column].quantile(truncation_lower_bound)
+        upper_bound = ipw[column].quantile(truncation_upper_bound)
+
+        # Clip the column using these bounds and alias it back to the original column name
+        expressions.append(ipw[column].clip(lower_bound, upper_bound))
+
+    # Apply the clipping to the DataFrame
+    clipped_ipw = ipw.with_columns(expressions)
+
+    return clipped_ipw
+--------------------------------------------------
+
+==================================================
+.\simulation\learning_policies.py
+==================================================
+import polars as pl
+import numpy as np
+from .policy import Policy
+from .population import Population
+from .ground_truth import (
+    calculate_probabilities_from_logits,
+    calculate_rewards,
+)
+from sklearn.linear_model import SGDClassifier
+import warnings
+
+
+from .policy_utils import arg_max_horizontal
+
+
+class LearningPolicy(Policy):
+    """
+    Base class for policies that can learn.
+    Introduces the `learn` method and `can_learn` / `train_on_use` flags.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.can_learn = True
+        self.train_on_use = True  # Default: learn when used in engine
+
+    def learn(
+        self,
+        population: Population,
+        product_outcome_df: pl.DataFrame,
+        chosen_action_series: pl.Series,
+        action_propensity_series: pl.Series,
+        current_step: int,
+    ):
+        """
+        Abstract method for learning. Implement in subclasses.
+        """
+        raise NotImplementedError("Learning policies must implement a 'learn' method.")
+
+
+class CausalBanditPolicy(LearningPolicy):
+    """
+    A causal bandit policy that learns the ground truth probabilities
+    and makes choices to maximize expected reward using an epsilon-greedy strategy.
+    It trains an SGDClassifier for each product incrementally, using inverse propensity weighting.
+    """
+
+    def __init__(
+        self,
+        epsilon: float = 0.1,
+        learning_rate: float = 0.01,  # SGDClassifier handles its own learning rate via 'eta0'
+        fit_interval: int = 1,
+        train_on_use: bool = True,
+        experiment_fraction: float = 1.0,  # Fraction of population to experiment on
+        experiment_min_rounds_since_last_experiment: int = 0,  # Min rounds before re-experimenting on a subject
+    ):
+        super().__init__()
+        self.epsilon = epsilon  # Exploration rate
+        self.fit_interval = fit_interval  # How often to refit the models
+        self.train_on_use = train_on_use  # Whether to train the model during simulation
+        self.experiment_fraction = experiment_fraction
+        self.experiment_min_rounds_since_last_experiment = (
+            experiment_min_rounds_since_last_experiment
+        )
+
+        self.models = {}  # Stores SGDClassifier models for each product
+        self.history_df = None  # Stores historical data for training
+
+        # Parameters for SGDClassifier
+        self.sgd_params = {
+            "loss": "log_loss",  # Logistic regression
+            "penalty": "l2",  # L2 regularization
+            "alpha": learning_rate,  # Regularization strength (acts like 1/learning_rate in some contexts)
+            "max_iter": 1,  # Process one sample at a time
+            "learning_rate": "adaptive",  # Adaptive learning rate
+            "eta0": 0.01,  # Initial learning rate for adaptive
+            "random_state": 42,
+            "warm_start": True,  # Keep parameters from previous fit
+        }
+
+    def choose(
+        self, population: Population, current_step: int
+    ) -> tuple[pl.Series, pl.Series]:
+        """
+        Chooses an action for each customer based on an epsilon-greedy strategy.
+        Explores randomly or exploits learned models to maximize expected reward.
+
+        Args:
+            population: The Population object containing the current state and config.
+            current_step: The current simulation step number (for recency tracking).
+
+        Returns:
+            tuple[pl.Series, pl.Series]: A tuple containing:
+                - A Polars Series of chosen action names for each customer.
+                - A Polars Series of propensity scores for each chosen action.
+        """
+        n_customers = population._state.height
+        available_actions = list(population.action_hierarchy.get_leaves())
+        no_action_node = "NoAction"  # Assuming 'NoAction' is handled as a special case
+
+        product_list = population.product_hierarchy.get_leaves()
+
+        # Initialize chosen actions and propensity scores
+        chosen_actions_series = pl.Series(
+            "chosen_action", [""] * n_customers, dtype=pl.Categorical
+        )
+        action_propensity_series = pl.Series(
+            "action_propensity_score", [0.0] * n_customers, dtype=pl.Float64
+        )
+
+        eligible_for_experiment_mask = (
+            population._state["last_experiment_round"] == -1
+        ) | (
+            current_step - population._state["last_experiment_round"]
+            >= self.experiment_min_rounds_since_last_experiment
+        )
+        eligible_indices = (
+            population._state.lazy()
+            .select(pl.col("last_experiment_round").arg_sort())
+            .collect()["last_experiment_round"]
+            .to_numpy()
+        )
+        eligible_indices = eligible_indices[eligible_for_experiment_mask.to_numpy()]
+
+        num_to_experiment = int(self.experiment_fraction * n_customers)
+        if len(eligible_indices) < num_to_experiment:
+            warnings.warn(
+                f"Not enough eligible customers ({len(eligible_indices)}) for experimentation fraction ({self.experiment_fraction}). Experimenting on all eligible."
+            )
+            experiment_indices = eligible_indices
+        else:
+            # Randomly select a subset of eligible customers for experimentation
+            experiment_indices = np.random.choice(
+                eligible_indices, size=num_to_experiment, replace=False
+            )
+
+        # Identify customers not selected for experimentation
+        non_experiment_indices = np.setdiff1d(
+            np.arange(n_customers), experiment_indices
+        )
+
+        # For non-experimented customers, choose 'NoAction'
+        if len(non_experiment_indices) > 0:
+            chosen_actions_series = (
+                chosen_actions_series.to_frame()
+                .with_columns(
+                    pl.Series(
+                        non_experiment_indices,
+                        [no_action_node] * len(non_experiment_indices),
+                        dtype=pl.Categorical,
+                    ).alias("chosen_action")
+                )
+                .get_column("chosen_action")
+            )
+            # Propensity for 'NoAction' when forced is 1.0, but practically 0 for learning purposes
+            # For IPW, the propensity of *choosing* it by design is 1.0, but if it's forced, it's not a choice.
+            # We will assign 1.0 for these.
+            action_propensity_series = (
+                action_propensity_series.to_frame()
+                .with_columns(
+                    pl.Series(
+                        non_experiment_indices,
+                        [1.0] * len(non_experiment_indices),
+                        dtype=pl.Float64,
+                    ).alias("action_propensity_score")
+                )
+                .get_column("action_propensity_score")
+            )
+
+        # Process customers selected for experimentation
+        if len(experiment_indices) > 0:
+            experimental_population_state = population._state.row(
+                experiment_indices, named=True
+            )
+            num_experimental_customers = len(experiment_indices)
+
+            # Prepare to store actions and propensities for experimental group
+            exp_chosen_actions = np.empty(num_experimental_customers, dtype=object)
+            exp_action_propensities = np.empty(
+                num_experimental_customers, dtype=np.float64
+            )
+
+            # Loop through each customer in the experimental group
+            for i, customer_idx in enumerate(experiment_indices):
+                # Epsilon-greedy decision for this individual customer
+                if np.random.rand() < self.epsilon or not self.models:
+                    # Exploration: Choose a random action
+                    chosen_action = np.random.choice(available_actions)
+                    # Propensity for random choice: 1 / (number of available actions)
+                    propensity = 1.0 / len(available_actions)
+                else:
+                    # Exploitation: Predict optimal action based on learned models
+                    # Create a temporary single-row DataFrame for prediction
+                    single_customer_df = pl.DataFrame(experimental_population_state[i])
+
+                    # Get features for this single customer
+                    X_for_prediction = single_customer_df.select(
+                        population.x_columns
+                        + population.action_columns
+                        + population.interaction_columns
+                        + ["intercept"]
+                    )
+
+                    best_action = None
+                    max_expected_reward = -np.inf
+                    action_probabilities_for_ipw = {}  # Store probabilities for IPW
+
+                    # Iterate through available actions to find the best one for this customer
+                    for action in available_actions:
+                        # Temporarily modify X_for_prediction to reflect this hypothetical action
+                        # We need to simulate the expanded action features and interaction terms
+                        # for this single customer and this hypothetical action.
+                        temp_df = single_customer_df.clone()
+                        temp_df = temp_df.with_columns(
+                            pl.Series("A_t", [action], dtype=pl.Categorical)
+                        )
+                        temp_expanded_actions = population.transform_actions_for_policy(
+                            temp_df["A_t"]
+                        )
+                        temp_interactions = (
+                            population.calculate_interactions_for_policy(
+                                temp_expanded_actions, temp_df
+                            )
+                        )
+
+                        # Create the full feature vector for prediction for this hypothetical action
+                        # Ensure column order matches training
+                        features_for_single_pred = temp_df.select(
+                            population.x_columns + ["intercept"]
+                        ).with_columns(temp_expanded_actions, temp_interactions)
+
+                        # Reorder columns to match the order used during training (important for SGD)
+                        # This requires knowing the exact column order that SGDClassifier expects.
+                        # This is a bit tricky, as SGDClassifier doesn't store feature names directly.
+                        # For now, let's assume the column order is consistent with how `learn` creates X_train.
+
+                        # A more robust solution might involve a ColumnTransformer or similar preprocessing pipeline
+                        # that stores feature order, or training on Polars DataFrames directly if a Polars-native
+                        # LR/SGD is available. Given the current setup, we need to manually ensure order.
+
+                        # The simplest assumption for now is that the order of `population.x_columns`,
+                        # `population.action_columns`, `population.interaction_columns`, and `intercept`
+                        # is maintained consistently.
+
+                        expected_feature_order = (
+                            population.x_columns
+                            + population.action_columns
+                            + population.interaction_columns
+                            + ["intercept"]
+                        )
+
+                        # Filter features_for_single_pred to only include expected columns and reorder
+                        actual_cols = features_for_single_pred.columns
+
+                        missing_in_features = set(expected_feature_order) - set(
+                            actual_cols
+                        )
+                        if missing_in_features:
+                            warnings.warn(
+                                f"During policy exploitation, expected features missing: {missing_in_features}. This might lead to incorrect predictions."
+                            )
+                            # Add missing columns with zeros
+                            for col in missing_in_features:
+                                features_for_single_pred = (
+                                    features_for_single_pred.with_columns(
+                                        pl.lit(0).alias(col)
+                                    )
+                                )
+
+                        # Drop extra columns not in expected order and reorder
+                        features_for_single_pred = features_for_single_pred.select(
+                            expected_feature_order
+                        )
+
+                        predicted_probabilities_for_product_dict = {}
+                        for product in product_list:
+                            model = self.models.get(product)
+                            if model is not None and hasattr(model, "predict_proba"):
+                                try:
+                                    # Use .to_numpy() on the single row DataFrame
+                                    proba = model.predict_proba(
+                                        features_for_single_pred.to_numpy()
+                                    )[0, 1]
+                                    predicted_probabilities_for_product_dict[
+                                        product
+                                    ] = proba
+                                except Exception as e:
+                                    warnings.warn(
+                                        f"Prediction failed for product {product} with action {action}: {e}. Setting prob to 0."
+                                    )
+                                    predicted_probabilities_for_product_dict[
+                                        product
+                                    ] = 0.0
+                            else:
+                                predicted_probabilities_for_product_dict[product] = (
+                                    0.0  # No model, no prediction
+                                )
+
+                        # Calculate expected reward for this action for this customer
+                        expected_reward = sum(
+                            predicted_probabilities_for_product_dict.get(p, 0.0)
+                            * population.product_hierarchy.get_reward(p)
+                            for p in product_list
+                        ) - population.action_hierarchy.get_cost(action)
+
+                        # Store for IPW calculation later: probability of choosing *this* action
+                        # P(action) = P(exploit) * P(action|exploit) + P(explore) * P(action|explore)
+                        # P(action|exploit) is 1.0 for the chosen action if it's the argmax, 0 otherwise.
+                        # P(action|explore) is 1/len(available_actions)
+
+                        # For IPW, we need the probability of the chosen action *under the current policy*.
+                        # If policy chose exploitation: the probability of the chosen action is 1 - epsilon
+                        # If policy chose exploration: the probability of the chosen action is epsilon / num_actions
+                        action_probabilities_for_ipw[action] = (
+                            expected_reward  # Store the expected reward for argmax selection
+                        )
+
+                        if expected_reward > max_expected_reward:
+                            max_expected_reward = expected_reward
+                            best_action = action
+
+                    chosen_action = (
+                        best_action
+                        if best_action is not None
+                        else np.random.choice(available_actions)
+                    )
+
+                    # Calculate propensity score for the chosen action
+                    # This is the probability that the policy selected this action for this customer
+                    # It's (1-epsilon) if exploited or epsilon/N_actions if explored
+                    propensity = (1 - self.epsilon) * (
+                        1.0 if chosen_action == best_action else 0.0
+                    ) + self.epsilon * (1.0 / len(available_actions))
+
+                    # A small epsilon-greedy adjustment to ensure propensity is never zero for observed actions
+                    # to avoid division by zero in IPW. Add a tiny constant.
+                    propensity = max(propensity, 1e-9)
+
+                # Assign chosen action and propensity for this individual
+                chosen_actions_series = (
+                    chosen_actions_series.to_frame()
+                    .with_columns(
+                        pl.Series(
+                            [customer_idx], [chosen_action], dtype=pl.Categorical
+                        ).alias("chosen_action")
+                    )
+                    .get_column("chosen_action")
+                )
+
+                action_propensity_series = (
+                    action_propensity_series.to_frame()
+                    .with_columns(
+                        pl.Series([customer_idx], [propensity], dtype=pl.Float64).alias(
+                            "action_propensity_score"
+                        )
+                    )
+                    .get_column("action_propensity_score")
+                )
+
+        # Update last_experiment_round for all customers
+        updated_last_experiment_round = (
+            population._state["last_experiment_round"].to_numpy().copy()
+        )
+
+        # Increment for non-experimented customers (if not -1)
+        # For customers who were not selected for experimentation in this round, their counter increases.
+        # This includes those who were ineligible and those eligible but not chosen.
+        for idx in non_experiment_indices:
+            if updated_last_experiment_round[idx] != -1:
+                updated_last_experiment_round[idx] = (
+                    updated_last_experiment_round[idx] + 1
+                )
+            else:
+                # If they were never experimented on and not chosen this round, they remain -1
+                pass
+
+        # For experimented customers, set to current_step
+        updated_last_experiment_round[experiment_indices] = current_step
+
+        population._state = population._state.with_columns(
+            pl.Series(
+                "last_experiment_round", updated_last_experiment_round, dtype=pl.Int32
+            )
+        )
+
+        return chosen_actions_series, action_propensity_series
+
+    def learn(
+        self,
+        population: Population,
+        product_outcome_df: pl.DataFrame,
+        chosen_action_series: pl.Series,
+        action_propensity_series: pl.Series,  # New argument for propensity score
+        current_step: int,
+    ):
+        """
+        Trains or updates the internal models based on observed data using SGDClassifier.
+        This method is called by the Engine after each simulation step.
+        It uses Inverse Propensity Weighting (IPW) for unbiased learning.
+
+        Args:
+            population: The current Population object.
+            product_outcome_df: DataFrame with binary product purchase outcomes for the current step.
+            chosen_action_series: Series of actions chosen by the policy for the current step.
+            action_propensity_series: Series of propensity scores for each chosen action.
+            current_step: The current simulation step number.
+        """
+        if not self.train_on_use:
+            return  # Do not learn if train_on_use is False
+
+        product_list = population.product_hierarchy.get_leaves()
+
+        # Get the full expanded state for the current step, which now contains the chosen actions
+        # and interactions based on the policy's actual choices.
+        current_expanded_state = population._state.clone()
+
+        # Add the binary product outcomes to the expanded state for training
+        outcome_df_selected = product_outcome_df.select(
+            [pl.col(p).alias(f"{p}_outcome") for p in product_list]
+        )
+
+        # The features for training are X, A (expanded), and interactions, plus intercept
+        features_for_training = current_expanded_state.select(
+            population.x_columns
+            + population.action_columns
+            + population.interaction_columns
+            + ["intercept"]
+        )
+
+        # Combine features, outcomes, and propensity scores for history
+        current_history_df = pl.concat(
+            [
+                features_for_training,
+                outcome_df_selected,
+                action_propensity_series.alias("propensity_score"),
+            ],
+            how="horizontal",
+        )
+        # Ensure column order matches what will be used in prediction later
+        self.feature_columns_order = features_for_training.columns
+
+        if self.history_df is None:
+            self.history_df = current_history_df
+        else:
+            # Harmonize columns before concatenation
+            # Add missing columns to current_history_df with default 0 if they exist in history_df but not current
+            missing_in_current = set(self.history_df.columns) - set(
+                current_history_df.columns
+            )
+            for col in missing_in_current:
+                current_history_df = current_history_df.with_columns(
+                    pl.lit(0).alias(col).cast(self.history_df[col].dtype)
+                )
+
+            # Select and reorder columns of current_history_df to match self.history_df
+            current_history_df = current_history_df.select(self.history_df.columns)
+
+            self.history_df = pl.concat(
+                [self.history_df, current_history_df], how="vertical"
+            )
+
+        print(
+            f"  Policy: Collected data for step {current_step}. Total history rows: {self.history_df.height}"
+        )
+
+        # Use partial_fit at every step for online learning
+        if (current_step + 1) % self.fit_interval == 0 and self.history_df.height > 0:
+            print(
+                f"  Policy: Incrementally training models at step {current_step+1}..."
+            )
+
+            # Use only the latest batch of data for partial_fit for true online learning
+            # or a window of recent data, depending on 'batch' size for partial_fit.
+            # Here, we'll just use the `current_history_df` as the "batch".
+            X_batch = current_history_df.select(self.feature_columns_order).to_numpy()
+            propensity_scores_batch = current_history_df["propensity_score"].to_numpy()
+
+            # Define classes for SGDClassifier's partial_fit. Crucial for first fit.
+            classes = np.array([0, 1])
+
+            for product in product_list:
+                y_batch = current_history_df[f"{product}_outcome"].to_numpy()
+
+                # Calculate IPW weights: 1 / P(action_chosen)
+                # Ensure no division by zero for propensity_score (handled in choose)
+                sample_weights = 1.0 / propensity_scores_batch
+
+                if product not in self.models or self.models[product] is None:
+                    self.models[product] = SGDClassifier(**self.sgd_params)
+                    try:
+                        self.models[product].partial_fit(
+                            X_batch,
+                            y_batch,
+                            classes=classes,
+                            sample_weight=sample_weights,
+                        )
+                        print(
+                            f"    Initialized and partially fitted model for product: {product}"
+                        )
+                    except ValueError as e:
+                        warnings.warn(
+                            f"Could not initialize and partially fit model for product {product}: {e}. Skipping model update for this product."
+                        )
+                        self.models[product] = None  # Mark as untrainable for now
+                else:
+                    try:
+                        self.models[product].partial_fit(
+                            X_batch, y_batch, sample_weight=sample_weights
+                        )
+                        print(f"    Partially fitted model for product: {product}")
+                    except Exception as e:
+                        warnings.warn(
+                            f"Could not partially fit model for product {product}: {e}. Model for this product might be stale."
+                        )
+--------------------------------------------------
+
+==================================================
+.\simulation\policy.py
+==================================================
+class Policy:
+    def __init__(self):
+        pass
+
+    def choose(self):
+        NotImplementedError
+
+    def learn(self):
+        NotImplementedError
+--------------------------------------------------
+
+==================================================
+.\simulation\policy_utils.py
+==================================================
+import polars as pl
+
+
+def arg_max_horizontal(*columns: pl.Expr) -> pl.Expr:
+    """
+    Polars expression to find the column name with the maximum value horizontally.
+    Assumes columns are named after the actions they represent.
+    """
+    # Create a list of (column_name, column_expression) tuples
+    named_expressions = [(col.name, col) for col in columns]
+
+    # Concatenate all columns into a list
+    list_expr = pl.concat_list([expr for _, expr in named_expressions])
+
+    # Find the index of the maximum value in the list for each row
+    max_idx_expr = list_expr.list.arg_max()
+
+    # Create a mapping from index to column name
+    index_to_name_map = {i: name for i, (name, _) in enumerate(named_expressions)}
+
+    # Replace the index with the actual column name
+    return max_idx_expr.map_dict(index_to_name_map).alias("chosen_action")
+--------------------------------------------------
+
+==================================================
+.\simulation\population.py
+==================================================
+# population.py
+import polars as pl
+import numpy as np
+import warnings
+
+# from .config import SIMULATION_CONFIG
+from .hierarchy import ProductHierarchy, ActionHierarchy
+from .action_transformer import transform_actions
+from .ground_truth import (
+    create_ground_truth_function,
+    calculate_probabilities_from_logits,
+    sample_bernoulli_from_probabilities,
+)
+
+
+class Population:
+    # Type hint config as a dictionary
+    def __init__(
+        self,
+        config: dict,
+        product_hierarchy: ProductHierarchy,
+        action_hierarchy: ActionHierarchy,
+    ):
+        self.config = config
+        self.product_hierarchy = product_hierarchy
+        self.action_hierarchy = action_hierarchy
+
+        # REMOVE THIS
+        # self.features_names = self._get_x_column_names()
+        self.continuous_cols = self.config["CUSTOMER_FEATURES_X"]["continuous"]
+        self.binary_cols = self.config["CUSTOMER_FEATURES_X"]["binary"]
+        self.categorical_cols = self.config["CUSTOMER_FEATURES_X"]["categorical"]
+
+        # These will be set once we expand the initial state
+        self.x_columns = None
+        self.eligibility_columns = [
+            f"eligibility_{x}" for x in self.config["INITIAL_ELIGIBILITY_PROBS"]
+        ]
+
+        self.action_columns = list(
+            set(self._get_action_column_names()) - set(["NoAction"])
+        )
+
+        self.interaction_columns = None
+
+        self.product_list = self.product_hierarchy.get_leaves()
+
+        self.current_product_names = [f"{p}_t" for p in self.product_list]
+        self.previous_product_names = [f"{p}_t_minus_1" for p in self.product_list]
+
+        # Initialize the state DataFrame S_t based on config access
+        self._state = self.create_customer_dataframe(self.config, self.product_list)
+        self._state = self._expand_state()
+
+        # Set the experimentation counter for the population to -1
+        self._state = self._state.with_columns(
+            pl.lit(-1).alias("last_experiment_round").cast(pl.Int32)
+        )
+
+    def create_customer_dataframe(
+        self, config: dict, product_names: list[str]
+    ) -> pl.DataFrame:
+        """
+        Creates a Polars DataFrame based on the provided simulation configuration
+        and adds additional columns related to product actions.
+
+        Args:
+            config (dict): A dictionary containing simulation parameters, including
+                        customer features.
+            product_names (list[str]): A list of product names to create related columns.
+
+        Returns:
+            pl.DataFrame: A Polars DataFrame with simulated customer and product data.
+        """
+        n_customers = config["N_CUSTOMERS"]
+        customer_features_x = config["CUSTOMER_FEATURES_X"]
+
+        data = {}
+
+        # Create continuous columns
+        for col_name in customer_features_x["continuous"]:
+            data[col_name] = np.random.normal(0, 1, n_customers).astype(np.float32)
+
+        # Create binary columns
+        for col_name in customer_features_x["binary"]:
+            data[col_name] = np.random.randint(0, 2, n_customers).astype(
+                np.int8
+            )  # Use int8 for 0/1
+
+        # Initialize the Polars DataFrame with the existing data
+        df = pl.DataFrame(data)
+
+        # Create categorical columns
+        for col_name, categories in customer_features_x["categorical"].items():
+            df = df.with_columns(
+                pl.Series(
+                    col_name,
+                    np.random.choice(categories, n_customers),
+                    dtype=pl.Categorical,
+                )
+            )
+
+        # 1. Add 'A_t' column with 'NoAction'
+        df = df.with_columns(
+            pl.Series("A_t", ["NoAction"] * n_customers, dtype=pl.Categorical)
+        )
+
+        # 2. Add product_name_t columns filled with 0s (u8)
+        for product in product_names:
+            column_name = f"{product}_t"
+            df = df.with_columns(
+                pl.Series(column_name, [0] * n_customers, dtype=pl.UInt8)
+            )
+
+        # 3. Add product_name_t_minus_1 columns filled with 0s (u8)
+        for product in product_names:
+            column_name = f"{product}_t_minus_1"
+            df = df.with_columns(
+                pl.Series(column_name, [0] * n_customers, dtype=pl.UInt8)
+            )
+
+        # 4. Add eligibility indicators
+        for action in self.config["INITIAL_ELIGIBILITY_PROBS"]:
+            action_eligibility_name = f"eligibility_{action}"
+            df = df.with_columns(
+                pl.Series(
+                    action_eligibility_name,
+                    np.random.binomial(
+                        n=1,
+                        p=self.config["INITIAL_ELIGIBILITY_PROBS"][action],
+                        size=n_customers,
+                    ),
+                )
+            )
+
+        return df
+
+    def _expand_state(self) -> pl.DataFrame:
+        """
+        Expands the population state to a dataframe that can be used in models.
+
+        Returns:
+            pl.DataFrame: The expanded Polars DataFrame.
+        """
+        # Combine all columns to keep directly
+        x_cols = self.continuous_cols + self.binary_cols
+
+        n_rows = self._state.shape[0]
+
+        # Start with a selection of the columns we want to retain
+        expanded_df = self._state.select(x_cols)
+
+        # 1. One-hot encode categorical variables
+        for col_name in self.categorical_cols:
+
+            level_to_exclude = self.config[
+                "CUSTOMER_FEATURES_CATEGORICAL_LEVELS_TO_DROP"
+            ][col_name]
+
+            # Polars one-hot encoding: use pl.Categorical and then to_dummies
+            # We need to leave out one category. By default, to_dummies will drop the first one.
+            # Ensure the series is categorical for efficient one-hot encoding
+            categorical_series = self._state[col_name]
+
+            # Generate dummy variables, dropping the category that is names in the config file
+            dummy_df = categorical_series.to_dummies(separator="_")
+            dummy_df = dummy_df.select(pl.exclude(f"{col_name}_{level_to_exclude}"))
+
+            expanded_df = pl.concat([expanded_df, dummy_df], how="horizontal")
+
+        # The new x_cols are all the continuous/binary/one hot encoded columns
+        self.x_columns = expanded_df.columns
+
+        # 2. Add the outcome columns to the dataframe
+        y_cols = self.current_product_names + self.previous_product_names
+
+        expanded_df = pl.concat(
+            [expanded_df, self._state.select(y_cols)], how="horizontal"
+        )
+
+        # 4. Expand A_t column using transform_actions
+        actions_expanded_df = transform_actions(
+            self._state["A_t"], self.action_hierarchy
+        )
+
+        expanded_df = pl.concat([expanded_df, actions_expanded_df], how="horizontal")
+
+        # Add the original A_t column
+        expanded_df = expanded_df.with_columns(self._state["A_t"])
+
+        # 5. Create Cartesian product columns (x_features * actions)
+        interactions = []
+        interaction_column_names = []
+        for action_col in self.action_columns:
+            for x_feature in self.x_columns:
+                new_col_name = (
+                    f"{action_col}_x_{x_feature}"  # Naming convention for new columns
+                )
+                interactions.append(
+                    (expanded_df[action_col] * expanded_df[x_feature]).alias(
+                        new_col_name
+                    )
+                )
+
+                interaction_column_names.append(new_col_name)
+
+        expanded_df = expanded_df.with_columns(interactions)
+        self.interaction_columns = interaction_column_names
+
+        # 6. Add 'intercept' column filled with 1s
+        expanded_df = expanded_df.with_columns(
+            pl.Series("intercept", [1] * n_rows, dtype=pl.UInt8)
+        )
+
+        # 7. Add eligibility indicators
+        for action in self.config["INITIAL_ELIGIBILITY_PROBS"]:
+            action_eligibility_name = f"eligibility_{action}"
+            expanded_df = expanded_df.with_columns(
+                pl.Series(
+                    action_eligibility_name,
+                    np.random.binomial(
+                        n=1,
+                        p=self.config["INITIAL_ELIGIBILITY_PROBS"][action],
+                        size=n_rows,
+                    ),
+                )
+            )
+
+        return expanded_df
+
+    def update_state_with_actions(self, actions: pl.Series):
+        actions_df = transform_actions(actions, self.action_hierarchy)
+
+        interactions = []
+        for action_col in self.action_columns:
+            for x_feature in self.x_columns:
+                new_col_name = (
+                    f"{action_col}_x_{x_feature}"  # Naming convention for new columns
+                )
+                interactions.append(
+                    (actions_df[action_col] * self._state[x_feature]).alias(
+                        new_col_name
+                    )
+                )
+
+        # Update the state for actions and interactions between X and action A
+        # A_t is kept in the state of the population, so that we can calculate the IPW
+        self._state = (
+            self._state.with_columns(
+                *[actions_df[col_name] for col_name in actions_df.columns]
+            )
+            .with_columns(interactions)
+            .with_columns(actions.alias("A_t"))
+        )
+
+    def simulate_product_possession_outcome(
+        self, seed: int | None = None
+    ) -> pl.DataFrame:
+        """
+        Simulates the outcome of product possession based on the current state
+        and ground truth weights. This involves:
+        1. Calculating logit scores using the ground truth function.
+        2. Converting logits to probabilities using the sigmoid function.
+        3. Sampling binary (0/1) outcomes based on these probabilities.
+        4. Updating the population's product ownership state based on the regime.
+
+        Args:
+            ground_truth_weights (dict): The dictionary containing the ground truth
+                                         weights for each product.
+            seed (int | None): An optional integer seed for reproducibility of the
+                                Bernoulli sampling.
+
+        Returns:
+            pl.DataFrame: A Polars DataFrame containing the binary (0/1) product
+                          possession outcomes for the current time step for each product.
+                          Columns are named after the products (e.g., 'Coffee', 'Tea').
+        """
+        # Create the ground truth function dynamically
+        ground_truth_func = create_ground_truth_function(self.config)
+
+        # Calculate logit scores for all products for the current state
+        # The ground_truth_func expects the expanded state DataFrame
+        logits_df = ground_truth_func(self._state)
+
+        # Calculate probabilities from logits
+        probabilities_df = calculate_probabilities_from_logits(logits_df)
+
+        # Sample binary outcomes from probabilities
+        binary_outcomes_df = sample_bernoulli_from_probabilities(
+            probabilities_df, seed=seed
+        )
+
+        # Update the population's internal product ownership state
+        # This handles the shifting of _t to _t_minus_1 and updating _t based on the regime
+        self.update_product_ownership(binary_outcomes_df)
+
+        return binary_outcomes_df
+
+    def _get_action_column_names(self):
+        return self.action_hierarchy.get_all_non_root_nodes()
+
+    # REMOVE THIS
+    # def _get_x_column_names(self):
+    #     """Helper to generate column names for X features including one-hot encoding."""
+    #     x_cols = []
+    #     # Access config using square brackets
+    #     x_config = self.config.get(
+    #         "CUSTOMER_FEATURES_X", {}
+    #     )  # Use get with default empty dict
+
+    #     # Continuous features
+    #     continuous_cols = x_config.get("continuous", [])
+    #     if not isinstance(continuous_cols, list):
+    #         warnings.warn(
+    #             "CUSTOMER_FEATURES_X 'continuous' should be a list. Skipping."
+    #         )
+    #         continuous_cols = []
+    #     x_cols.extend(continuous_cols)
+
+    #     # Binary features
+    #     binary_cols = x_config.get("binary", [])
+    #     if not isinstance(binary_cols, list):
+    #         warnings.warn("CUSTOMER_FEATURES_X 'binary' should be a list. Skipping.")
+    #         binary_cols = []
+    #     x_cols.extend(binary_cols)
+
+    #     # Categorical features (one-hot encoded, dropping one level)
+    #     categorical_config = x_config.get("categorical", {})
+    #     if not isinstance(categorical_config, dict):
+    #         warnings.warn(
+    #             "CUSTOMER_FEATURES_X 'categorical' should be a dictionary. Skipping."
+    #         )
+    #         categorical_config = {}
+
+    #     for cat_col, categories in categorical_config.items():
+    #         if not isinstance(categories, list) or len(categories) < 2:
+    #             warnings.warn(
+    #                 f"Categorical feature '{cat_col}' has invalid or insufficient categories ({categories}) in config. Needs at least 2 categories for OHE. Skipping."
+    #             )
+    #             continue
+    #         # OHE columns, dropping the first category as baseline
+    #         ohe_cols = [f"{cat_col}_{cat}" for cat in categories[1:]]
+    #         x_cols.extend(ohe_cols)
+
+    #     # Ensure uniqueness just in case and sort for consistency
+    #     x_cols = sorted(list(set(x_cols)))
+    #     return x_cols
+
+    def get_state(self) -> pl.DataFrame:
+        """Returns the current state DataFrame S_t."""
+        return self._state
+
+    # REMOVE THIS
+    # def get_features_X(self) -> pl.DataFrame:
+    #     """Returns the customer features (X) part of the state."""
+    #     return self._state.select(self.features_names)
+
+    def get_product_ownership(self) -> pl.DataFrame:
+        return self._state.select(self.current_product_names)
+
+    def get_previous_product_ownership(self) -> pl.DataFrame:
+        return self._state.select(self.previous_product_names)
+
+    def get_current_actions(self) -> pl.Series:
+        """Returns the current actions taken (A_t) part of the state."""
+        # Ensure the Series has the correct name 'A_t' and return it if it exists
+        if "A_t" in self._state.columns:
+            return self._state["A_t"].alias("A_t")
+        else:
+            # Should not happen if initialization was successful and N_CUSTOMERS > 0
+            warnings.warn(
+                "A_t column not found in state. Returning empty String series."
+            )
+            return pl.Series("A_t", [], dtype=pl.String)
+
+    def update_product_ownership(self, new_product_ownership: pl.DataFrame):
+        """
+        Updates the product ownership columns in the internal state DataFrame.
+
+        This function performs two main updates:
+        1. Shifts current product ownership ({product_name}_t) to become
+           previous product ownership ({product_name}_t_minus_1).
+        2. Overwrites current product ownership ({product_name}_t) with the
+           new sampled binary results.
+
+        Args:
+            new_product_ownership (pl.DataFrame): A Polars DataFrame containing
+                                                  the new binary (0/1) product
+                                                  ownership for the current timestep.
+                                                  Expected columns are {product_name}_t.
+        """
+
+        updates = []
+        for i, product in enumerate(self.product_list):
+
+            current_product_possesion = f"{product}_t"
+            previous_product_possession = f"{product}_t_minus_1"
+
+            updates.append(
+                pl.Series(
+                    previous_product_possession, self._state[current_product_possesion]
+                )
+            )
+            updates.append(
+                pl.Series(
+                    current_product_possesion,
+                    self._state[current_product_possesion]
+                    + new_product_ownership[product],
+                )
+            )
+
+        # Apply all updates in a single with_columns call for efficiency
+        self._state = self._state.with_columns(updates)
+--------------------------------------------------
+
+==================================================
+.\simulation\static_policies.py
+==================================================
+import polars as pl
+import numpy as np
+from .policy import Policy
+from .population import Population
+from .ground_truth import (
+    create_ground_truth_function,
+    calculate_probabilities_from_logits,
+    calculate_rewards,
+)
+
+
+def arg_max_horizontal(*columns: pl.Expr) -> pl.Expr:
+    return (
+        pl.concat_list(columns)
+        .list.arg_max()
+        .replace_strict({i: col_name for i, col_name in enumerate(columns)})
+    )
+
+
+class RandomPolicy(Policy):
+    """A policy that chooses a random action for each member of the population"""
+
+    def __init__(self):
+        super().__init__()
+
+    def choose(self, population: Population) -> pl.Series:
+        """
+        Chooses a random action for each customer in the population.
+
+        Args:
+            population_state_df (pl.DataFrame): The current state of the population.
+                                                This DataFrame is expected to contain all
+                                                features and historical data, but for this
+                                                policy, only the number of customers matters.
+            action_hierarchy: The ActionHierarchy object, used to get available actions.
+            product_list (list[str]): List of product names. Not directly used by this policy.
+            ground_truth_weights (dict): Ground truth weights. Not directly used by this policy.
+
+        Returns:
+            pl.Series: A Polars Series containing the randomly chosen action name for each customer.
+                       The series will have the same number of rows as population_state_df.
+        """
+        # Get all actionable nodes from the action hierarchy (those with defined costs)
+        # We need to exclude 'NoAction' if it's meant to be treated separately or always available
+        available_actions = list(
+            list(set(population.action_hierarchy.get_leaves() + ["NoAction"]))
+        )
+
+        n_customers = population._state.height
+
+        # Randomly choose an action for each customer
+        chosen_actions = np.random.choice(available_actions, n_customers)
+
+        return pl.Series("chosen_action", chosen_actions, dtype=pl.Categorical)
+
+
+class OptimalPolicy(Policy):
+    """A policy that chooses the best action for each member of the population by comparing expected values"""
+
+    def __init__(self):
+        super().__init__()
+
+    def choose(self, population: Population) -> pl.Series:
+        """
+        Chooses the optimal action for each customer based on maximizing expected reward.
+
+        This involves iterating through all possible actions, calculating the expected
+        reward for each action for every customer, and then selecting the action
+        that yields the highest expected reward for each customer.
+
+        Args:
+            population_state_df (pl.DataFrame): The current state of the population,
+                                                containing customer features (X) and
+                                                potentially current product ownership.
+                                                This DataFrame is already expanded.
+            action_hierarchy: The ActionHierarchy object, used to get all actionable nodes.
+            product_list (list[str]): A list of all relevant product names (leaf nodes).
+            ground_truth_weights (dict): The dictionary containing the ground truth
+                                         weights for each product, used to calculate
+                                         expected logits.
+
+        Returns:
+            pl.Series: A Polars Series containing the optimally chosen action name for each customer.
+                       The series will have the same number of rows as population_state_df.
+        """
+        n_customers = population._state.height
+
+        # Get all actionable nodes (actions that have a defined cost)
+        # These are the actions the policy can actually 'choose'.
+        available_actions = list(
+            list(set(population.action_hierarchy.get_leaves() + ["NoAction"]))
+        )
+
+        # Prepare a list to store the expected rewards for each action for each customer
+        all_actions_expected_rewards = []
+
+        # Create the ground truth function once
+        ground_truth_func = create_ground_truth_function(population.config)
+
+        all_actions_expected_rewards = []
+        for action in available_actions:
+            # Create a temporary DataFrame for this action scenario
+            # First, create a series representing this action choice for all customers
+            current_action_series = pl.Series(
+                "A_t", [action] * n_customers, dtype=pl.Categorical
+            )
+
+            population.update_state_with_actions(current_action_series)
+
+            # Calculate expected logits for this action scenario
+            # Ensure only columns relevant to the ground truth model are passed to the function
+            # The ground_truth_func handles selecting relevant columns based on weights.
+            expected_logits_for_action = ground_truth_func(population._state)
+
+            # Convert logits to probabilities
+            expected_probabilities_for_action = calculate_probabilities_from_logits(
+                expected_logits_for_action
+            )
+
+            # Calculate expected rewards based on these probabilities
+            # This gives a Series of expected reward per customer for this 'action'
+            expected_individual_rewards = calculate_rewards(
+                expected_probabilities_for_action,
+                population.config,
+            )
+
+            # Alias the expected reward series with the action name
+            all_actions_expected_rewards.append(
+                expected_individual_rewards.alias(action)
+            )
+
+        expected_rewards_df = pl.DataFrame(all_actions_expected_rewards)
+
+        # Find the action with the maximum expected reward for each customer
+        # We need to get the column name (action) that corresponds to the max value in each row.
+        # This requires a bit of manipulation in Polars.
+
+        max_column_expr = arg_max_horizontal(*expected_rewards_df.columns)
+
+        chosen_actions = (
+            expected_rewards_df.select(max_column_expr).to_series().cast(pl.Categorical)
+        )
+
+        return chosen_actions
+--------------------------------------------------
+
+==================================================
+.\simulation\__init__.py
+==================================================
+# simulation/__init__.py
+
+# Import core components to make them directly accessible
+from .config import SIMULATION_CONFIG
+from .engine import Engine
+from .hierarchy import ProductHierarchy, ActionHierarchy
+from .population import Population  # Added Population
+from .static_policies import RandomPolicy, OptimalPolicy
+from .policy import Policy
+from .action_transformer import transform_actions, transform_actions_to_series
+--------------------------------------------------
+

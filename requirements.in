@@ -1,0 +1,12 @@
+# numpyro
+matplotlib
+seaborn
+jupyterlab
+#jax
+#arviz
+networkx
+numpy
+scikit-learn
+torch
+torchvision
+torchaudio
