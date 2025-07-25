@@ -12,6 +12,7 @@ import seaborn as sns
 from tqdm import tqdm
 import lightgbm as lgb
 from torch.utils.data import Dataset, DataLoader
+import optuna
 
 # --- 1. Custom Dataset for Banner Data ---
 class BannerDataset(Dataset):
@@ -221,6 +222,58 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, epochs, d
         print(f"Epoch {epoch+1}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
     return train_losses, val_losses
 
+def objective(trial, train_loader, val_loader, n_numeric_features, categorical_field_dims, banner_field_idx, device):
+    """
+    The objective function for Optuna to minimize.
+    """
+    # 1. Suggest hyperparameters
+    embed_dim = trial.suggest_categorical('embed_dim', [8, 16, 32, 64])
+    lr = trial.suggest_float('lr', 1e-4, 1e-2, log=True)
+    dropout_rate = trial.suggest_float('dropout_rate', 0.1, 0.5)
+    weight_decay = trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
+    epochs = 10 # A fixed number of epochs for each trial
+
+    # 2. Build model and optimizer with suggested params
+    model = FactorizationMachine(
+        n_numeric_features=n_numeric_features,
+        categorical_field_dims=categorical_field_dims,
+        embed_dim=embed_dim,
+        banner_field_idx=banner_field_idx,
+        dropout_rate=dropout_rate
+    ).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = nn.BCEWithLogitsLoss(reduction='none')
+
+    # 3. Training and Validation Loop
+    for epoch in range(epochs):
+        model.train()
+        for x_num, x_cat, y, weights in train_loader:
+            x_num, x_cat, y, weights = x_num.to(device), x_cat.to(device), y.to(device), weights.to(device)
+            optimizer.zero_grad()
+            outputs = model(x_num, x_cat)
+            loss = (criterion(outputs, y) * weights).mean()
+            loss.backward()
+            optimizer.step()
+
+        # Validation
+        model.eval()
+        total_val_loss = 0
+        with torch.no_grad():
+            for x_num, x_cat, y, weights in val_loader:
+                x_num, x_cat, y, weights = x_num.to(device), x_cat.to(device), y.to(device), weights.to(device)
+                outputs = model(x_num, x_cat)
+                loss = (criterion(outputs, y) * weights).mean()
+                total_val_loss += loss.item()
+        
+        avg_val_loss = total_val_loss / len(val_loader)
+        
+        # 4. Report intermediate results for pruning
+        trial.report(avg_val_loss, epoch)
+        if trial.should_prune():
+            raise optuna.exceptions.TrialPruned()
+
+    return avg_val_loss # Return the final validation loss for this trial
+
 def evaluate_model(model, data_loader, device, title="Evaluation"):
     model.eval()
     all_labels, all_preds = [], []
@@ -352,3 +405,86 @@ if __name__ == '__main__':
     eligible_banners = [2, 7, 15, 45, new_banner_id]
     ranked_list = predict_banner_ranking(model, customer_num_feats, customer_cat_feats_nobanner, eligible_banners, device, alpha=0.0)
     print(f"Ranked banners for customer (exploitation only): {ranked_list}")
+
+# --- 7. Alternative Main Execution Block with Hyper Parameter Optimalization ---
+if __name__ == 'ksjdhfkjdsdfshkj':
+    # --- A. Generate & Preprocess Data (as before) ---
+    print("Generating synthetic data...")
+    num_samples, num_customers, num_banners, num_products = 50000, 1000, 100, 10
+    df = pd.DataFrame({
+        'customer_id': np.random.randint(0, num_customers, num_samples),
+        'banner_id': np.random.randint(0, num_banners, num_samples),
+        'product_id': np.random.randint(0, num_products, num_samples),
+        'customer_age': np.random.randint(18, 65, num_samples),
+        'customer_segment': np.random.choice(['A', 'B', 'C'], num_samples, p=[0.5, 0.3, 0.2]),
+    })
+    df.loc[df['customer_age'] > 50, 'banner_id'] = np.random.choice([0, 1, 2], len(df[df['customer_age'] > 50]), p=[0.6, 0.2, 0.2])
+    click_prob = 0.05 + (df['customer_segment'] == 'A') * 0.1 + (df['banner_id'] < 5) * 0.15 + (df['product_id'] == 0) * 0.2
+    df['clicked'] = (np.random.rand(num_samples) < click_prob).astype(int)
+    
+    categorical_cols = ['customer_id', 'banner_id', 'product_id', 'customer_segment']
+    numerical_cols = ['customer_age']
+    for col in categorical_cols: df[col] = LabelEncoder().fit_transform(df[col])
+    df[numerical_cols] = StandardScaler().fit_transform(df[numerical_cols])
+    
+    # --- B. Calculate Robust IPW (as before) ---
+    propensity_feature_cols = ['customer_id', 'product_id', 'customer_age', 'customer_segment']
+    propensity_model = train_propensity_model(df, propensity_feature_cols, 'banner_id')
+    df['ipw'] = calculate_stabilized_ipw(df, propensity_model, 'banner_id', propensity_feature_cols)
+    
+    # --- C. Create Datasets and DataLoaders (as before) ---
+    train_df, test_df = train_test_split(df, test_size=0.2, random_state=42, stratify=df['clicked'])
+    train_dataset = BannerDataset(train_df, categorical_cols, numerical_cols, 'clicked', 'ipw')
+    test_dataset = BannerDataset(test_df, categorical_cols, numerical_cols, 'clicked', 'ipw')
+    train_loader = DataLoader(train_dataset, batch_size=1024, shuffle=True, num_workers=2)
+    test_loader = DataLoader(test_dataset, batch_size=1024, shuffle=False, num_workers=2)
+    
+    # --- D. Run Hyperparameter Tuning ---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\nStarting hyperparameter tuning with Optuna on device: {device}")
+    
+    # Create a study object and specify the direction is to minimize the objective.
+    # A pruner is used to stop unpromising trials early.
+    study = optuna.create_study(direction='minimize', pruner=optuna.pruners.MedianPruner())
+    
+    # Start the optimization. Optuna will call the 'objective' function n_trials times.
+    study.optimize(lambda trial: objective(
+        trial,
+        train_loader,
+        test_loader,
+        n_numeric_features=len(numerical_cols),
+        categorical_field_dims=[df[col].nunique() for col in categorical_cols],
+        banner_field_idx=train_dataset.banner_idx,
+        device=device
+    ), n_trials=30) # Run 30 trials. Increase for a more thorough search.
+
+    # --- E. Print Tuning Results ---
+    print("\nHyperparameter tuning finished.")
+    print("Best trial:")
+    best_trial = study.best_trial
+    print(f"  Value (Validation Loss): {best_trial.value:.5f}")
+    print("  Params: ")
+    for key, value in best_trial.params.items():
+        print(f"    {key}: {value}")
+
+    print("\n--- All Trials Summary ---")
+    results_df = study.trials_dataframe()
+    print(results_df[['number', 'value', 'params_embed_dim', 'params_lr', 'params_dropout_rate', 'params_weight_decay', 'state']])
+
+    # --- F. Train Final Model with Best Hyperparameters ---
+    print("\nTraining final model with the best hyperparameters...")
+    best_params = study.best_params
+    final_model = FactorizationMachine(
+        n_numeric_features=len(numerical_cols),
+        categorical_field_dims=[df[col].nunique() for col in categorical_cols],
+        embed_dim=best_params['embed_dim'],
+        banner_field_idx=train_dataset.banner_idx,
+        dropout_rate=best_params['dropout_rate']
+    ).to(device)
+
+    optimizer = optim.Adam(final_model.parameters(), lr=best_params['lr'], weight_decay=best_params['weight_decay'])
+    criterion = nn.BCEWithLogitsLoss(reduction='none')
+    
+    # You would typically train this final model for more epochs on the full training set
+    # For this example, we'll just show the setup.
+    print("Final model is ready for full training and evaluation.")
