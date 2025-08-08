@@ -13,6 +13,7 @@ from tqdm import tqdm
 import lightgbm as lgb
 from torch.utils.data import Dataset, DataLoader
 import optuna
+import optuna.visualization as vis
 
 # --- 1. Custom Dataset for Banner Data ---
 class BannerDataset(Dataset):
@@ -317,6 +318,109 @@ def evaluate_model(model, data_loader, device, title="Evaluation"):
     
     plt.tight_layout(rect=[0, 0.03, 1, 0.95]); plt.show()
 
+# --- 5. NEW: Plotting and Hyperparameter Tuning ---
+
+def plot_training_history(train_losses, val_losses):
+    """
+    Visualizes the training and validation loss over epochs.
+    """
+    plt.figure(figsize=(10, 6))
+    plt.plot(train_losses, label='Training Loss', color='blue')
+    plt.plot(val_losses, label='Validation Loss', color='orange')
+    plt.title('Training and Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+def objective(trial, train_loader, val_loader, n_numeric_features, categorical_field_dims, banner_field_idx, device):
+    """
+    The objective function for Optuna to minimize.
+    """
+    # 1. Suggest hyperparameters
+    embed_dim = trial.suggest_categorical('embed_dim', [8, 16, 32, 64])
+    lr = trial.suggest_float('lr', 1e-4, 1e-2, log=True)
+    dropout_rate = trial.suggest_float('dropout_rate', 0.1, 0.5)
+    weight_decay = trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
+    epochs = 10 # A fixed number of epochs for each trial
+
+    # 2. Build model and optimizer with suggested params
+    model = FactorizationMachine(
+        n_numeric_features=n_numeric_features,
+        categorical_field_dims=categorical_field_dims,
+        embed_dim=embed_dim,
+        banner_field_idx=banner_field_idx,
+        dropout_rate=dropout_rate
+    ).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = nn.BCEWithLogitsLoss(reduction='none')
+
+    # 3. Training and Validation Loop
+    for epoch in range(epochs):
+        model.train()
+        for x_num, x_cat, y, weights in train_loader:
+            x_num, x_cat, y, weights = x_num.to(device), x_cat.to(device), y.to(device), weights.to(device)
+            optimizer.zero_grad()
+            outputs = model(x_num, x_cat)
+            loss = (criterion(outputs, y) * weights).mean()
+            loss.backward()
+            optimizer.step()
+
+        # Validation
+        model.eval()
+        total_val_loss = 0
+        with torch.no_grad():
+            for x_num, x_cat, y, weights in val_loader:
+                x_num, x_cat, y, weights = x_num.to(device), x_cat.to(device), y.to(device), weights.to(device)
+                outputs = model(x_num, x_cat)
+                loss = (criterion(outputs, y) * weights).mean()
+                total_val_loss += loss.item()
+        
+        avg_val_loss = total_val_loss / len(val_loader)
+        
+        # 4. Report intermediate results for pruning
+        trial.report(avg_val_loss, epoch)
+        if trial.should_prune():
+            raise optuna.exceptions.TrialPruned()
+
+    return avg_val_loss # Return the final validation loss for this trial
+
+def tune_hyperparameters(n_trials, train_loader, val_loader, n_numeric, cat_dims, banner_idx, device):
+    """
+    Performs hyperparameter tuning using Optuna and visualizes the results.
+    """
+    print(f"\n--- Starting Hyperparameter Tuning for {n_trials} trials ---")
+    study = optuna.create_study(direction='minimize', pruner=optuna.pruners.MedianPruner())
+    
+    # Use a lambda to pass the extra arguments to the objective function
+    func = lambda trial: objective(trial, train_loader, val_loader, n_numeric, cat_dims, banner_idx, device)
+    
+    study.optimize(func, n_trials=n_trials)
+
+    print("\n--- Hyperparameter Tuning Complete ---")
+    print(f"Best trial: {study.best_trial.number}")
+    print(f"Best validation loss: {study.best_value:.4f}")
+    print("Best hyperparameters:")
+    for key, value in study.best_params.items():
+        print(f"  {key}: {value}")
+    
+    # --- NEW: Visualize Tuning Results ---
+    print("\n--- Visualizing Tuning Study ---")
+    # Check if the study has completed trials before plotting
+    if len(study.trials) > 0:
+        # Plot 1: Shows the objective value for each trial
+        fig1 = vis.plot_optimization_history(study)
+        fig1.show()
+        
+        # Plot 2: Shows the importance of each hyperparameter
+        fig2 = vis.plot_param_importances(study)
+        fig2.show()
+    else:
+        print("No completed trials to visualize.")
+        
+    return study
+
 # --- 5. Prediction with Exploration (Largely unchanged) ---
 def predict_banner_ranking(model, customer_features_num, customer_features_cat, eligible_banners, device, alpha=0.05):
     if np.random.rand() < alpha:
@@ -371,19 +475,35 @@ if __name__ == '__main__':
     train_dataset = BannerDataset(train_df, categorical_cols, numerical_cols, 'clicked', 'ipw')
     test_dataset = BannerDataset(test_df, categorical_cols, numerical_cols, 'clicked', 'ipw')
     
-    train_loader = DataLoader(train_dataset, batch_size=1024, shuffle=True, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=1024, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=1024, shuffle=True, num_workers=0)
+    test_loader = DataLoader(test_dataset, batch_size=1024, shuffle=False, num_workers=0)
 
     # --- D. Initialize and Train Model ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\nUsing device: {device}")
+
+    categorical_field_dims=[df[col].nunique() for col in categorical_cols]
+    
+    # Run the tuning process, which will now also plot the results
+    study = tune_hyperparameters(
+        n_trials=20, # Increase for a more thorough search
+        train_loader=train_loader,
+        val_loader=test_loader,
+        n_numeric=len(numerical_cols),
+        cat_dims=categorical_field_dims,
+        banner_idx=train_dataset.banner_idx,
+        device=device
+    )
+
+    print("\n--- Training Final Model with Best Hyperparameters ---")
+    best_params = study.best_params
     
     model = FactorizationMachine(
         n_numeric_features=len(numerical_cols),
-        categorical_field_dims=[df[col].nunique() for col in categorical_cols],
-        embed_dim=16,
-        banner_field_idx=train_dataset.banner_idx, # Pass the safe index
-        dropout_rate=0.2
+        categorical_field_dims=categorical_field_dims,
+        embed_dim=best_params['embed_dim'],
+        banner_field_idx=train_dataset.banner_idx,
+        dropout_rate=best_params['dropout_rate']
     ).to(device)
     
     optimizer = optim.Adam(model.parameters(), lr=0.001)
