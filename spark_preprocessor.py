@@ -87,18 +87,25 @@ class SparkFeaturePreprocessor:
         Learns the scaling parameters and category mappings from the data.
         This is used for a "full retrain".
 
+        This optimized version reduces the number of passes over the data by
+        processing numerical and categorical features in separate, efficient stages.
+
         Args:
-            df (pyspark.sql.DataFrame): The training DataFrame.
+            df (pyspark.sql.DataFrame): The training DataFrame. It is recommended to
+                                       cache this DataFrame before passing it to this
+                                       method if it's used multiple times.
         """
         print("Fitting preprocessor...")
-        
-        # 1. Learn parameters for numerical columns
+
+        # --- Stage 1: Define and Execute Numerical Aggregations ---
+        # This part remains efficient. We define all aggregations and run them in one go.
         if self.numerical_cols:
             agg_exprs = []
             for col_name in self.numerical_cols:
                 agg_exprs.append(F.mean(col_name).alias(f"{col_name}_mean"))
                 agg_exprs.append(F.stddev(col_name).alias(f"{col_name}_stddev"))
             
+            print("Calculating numerical statistics (1st Spark job)...")
             stats_row = df.agg(*agg_exprs).first()
             
             for col_name in self.numerical_cols:
@@ -107,20 +114,44 @@ class SparkFeaturePreprocessor:
                 
                 self.numerical_scalers[col_name] = {
                     'mean': mean_val,
-                    # Handle zero standard deviation to prevent division by zero
-                    'stddev': stddev_val if stddev_val > 0 else 1.0
+                    # Handle None or zero standard deviation to prevent division by zero
+                    'stddev': stddev_val if stddev_val and stddev_val > 0 else 1.0
                 }
         
-        # 2. Learn mappings for categorical columns
-        for col_name in self.categorical_cols:
-            # Collect distinct categories and create an integer mapping
-            distinct_cats = df.select(col_name).distinct().collect()
-            mapping = {row[col_name]: i for i, row in enumerate(distinct_cats)}
+        # --- Stage 2: Define and Execute Categorical Value Collection ---
+        # This is the optimized section. Instead of looping and collecting,
+        # we unpivot the data to get all distinct values in a single pass.
+        if self.categorical_cols:
+            # Create the stack expression: stack(num_cols, 'col1_name', col1, 'col2_name', col2, ...)
+            # This transforms the DataFrame from wide to long format.
+            stack_expr_str = ", ".join([f"'{c}', `{c}`" for c in self.categorical_cols])
+            stack_expr = F.expr(f"stack({len(self.categorical_cols)}, {stack_expr_str})")
+
+            print("Collecting distinct categorical values (2nd Spark job)...")
+            unpivoted_df = df.select(stack_expr.alias("col_name", "value")) \
+                             .filter(F.col("value").isNotNull()) \
+                             .dropDuplicates()
+
+            # .collect() is a single action that brings all distinct values to the driver.
+            all_distinct_cats = unpivoted_df.collect()
+
+            # --- Stage 3: Process Collected Categorical Values on the Driver ---
+            # This part is fast as it operates on a small, local list of results.
             
-            self.categorical_maps[col_name] = {
-                'mapping': mapping,
-                'next_id': len(mapping)
-            }
+            # Initialize empty mappings first and group the collected rows by column name
+            temp_mappings = {col: [] for col in self.categorical_cols}
+            for row in all_distinct_cats:
+                temp_mappings[row.col_name].append(row.value)
+            
+            # Build the final mapping dictionaries
+            for col_name, values in temp_mappings.items():
+                # Sorting provides deterministic mapping (good for testing/reproducibility)
+                mapping = {val: i for i, val in enumerate(sorted(values))}
+                self.categorical_maps[col_name] = {
+                    'mapping': mapping,
+                    'next_id': len(mapping)
+                }
+
         print("Fit complete.")
         return self
 
@@ -167,44 +198,66 @@ class SparkFeaturePreprocessor:
 
     def _update_mappings_for_new_categories(self, df):
         """
-        Scans for new categories and updates mappings or raises errors accordingly.
-        This stateful update happens on the driver before the distributed transform.
+        (Optimized) Scans for new categories and updates mappings or raises errors accordingly.
+        This version finds all new categories for all columns in a single pass.
         """
         spark = SparkSession.builder.getOrCreate()
+
+        if not self.categorical_cols:
+            return
+
+        # --- Stage 1: Find all distinct values in the new DataFrame in one pass ---
+        stack_expr_str = ", ".join([f"'{c}', `{c}`" for c in self.categorical_cols])
+        stack_expr = F.expr(f"stack({len(self.categorical_cols)}, {stack_expr_str})")
         
-        for col_name in self.categorical_cols:
-            if not self.categorical_maps.get(col_name):
-                raise RuntimeError(f"Preprocessor not fitted for categorical column '{col_name}'.")
+        distinct_vals_in_df = df.select(stack_expr.alias("col_name", "value")) \
+                                .filter(F.col("value").isNotNull()) \
+                                .dropDuplicates()
 
-            # Get the new categories present in the DataFrame but not in our mapping
-            current_mapping = self.categorical_maps[col_name]['mapping']
-            known_cats_df = spark.createDataFrame(
-                [(k,) for k in current_mapping.keys()],
-                [col_name]
-            )
-            
-            new_cats_df = df.select(col_name).distinct() \
-                            .join(known_cats_df, on=col_name, how="left_anti")
-            
-            new_cats = [row[col_name] for row in new_cats_df.collect()]
+        # --- Stage 2: Create a DataFrame of already known categories ---
+        known_cats_data = []
+        for col_name, state in self.categorical_maps.items():
+            if not state.get('mapping'):
+                 raise RuntimeError(f"Preprocessor not fitted for categorical column '{col_name}'.")
+            for cat_value in state['mapping'].keys():
+                known_cats_data.append((col_name, cat_value))
+        
+        if not known_cats_data: # If no mappings exist at all
+            known_cats_df = spark.createDataFrame([], schema="col_name STRING, value STRING")
+        else:
+            known_cats_df = spark.createDataFrame(known_cats_data, ["col_name", "value"])
 
-            if new_cats:
-                if col_name in self.extendable_cols:
-                    # Extend the mapping for this column
-                    print(f"Found new categories for extendable column '{col_name}': {new_cats}")
-                    next_id = self.categorical_maps[col_name]['next_id']
-                    for cat in new_cats:
-                        if cat not in self.categorical_maps[col_name]['mapping']:
-                            print(f"  -> Extending mapping for '{col_name}': '{cat}' -> {next_id}")
-                            self.categorical_maps[col_name]['mapping'][cat] = next_id
-                            next_id += 1
-                    self.categorical_maps[col_name]['next_id'] = next_id
-                else:
-                    # This column is strict, so raise an error
-                    raise ValueError(
-                        f"Found unexpected new categories in 'strict' column '{col_name}': {new_cats}. "
-                        "This may indicate a data quality issue."
-                    )
+        # --- Stage 3: Find the difference and collect only the new categories ---
+        new_cats_df = distinct_vals_in_df.join(known_cats_df, on=["col_name", "value"], how="left_anti")
+        
+        # A single collect action to bring all new categories to the driver
+        new_cats_rows = new_cats_df.collect()
+
+        if not new_cats_rows:
+            return # No new categories found, we are done.
+
+        # --- Stage 4: Process new categories on the driver ---
+        new_cats_by_col = {}
+        for row in new_cats_rows:
+            if row.col_name not in new_cats_by_col:
+                new_cats_by_col[row.col_name] = []
+            new_cats_by_col[row.col_name].append(row.value)
+        
+        for col_name, new_values in new_cats_by_col.items():
+            if col_name in self.extendable_cols:
+                print(f"Found new categories for extendable column '{col_name}': {new_values}")
+                next_id = self.categorical_maps[col_name]['next_id']
+                for cat in new_values:
+                    if cat not in self.categorical_maps[col_name]['mapping']:
+                        print(f"  -> Extending mapping for '{col_name}': '{cat}' -> {next_id}")
+                        self.categorical_maps[col_name]['mapping'][cat] = next_id
+                        next_id += 1
+                self.categorical_maps[col_name]['next_id'] = next_id
+            else:
+                raise ValueError(
+                    f"Found unexpected new categories in 'strict' column '{col_name}': {new_values}. "
+                    "This may indicate a data quality issue."
+                )
     
     def save(self, file_path: str):
         """Saves the preprocessor state to a file using pickle."""
