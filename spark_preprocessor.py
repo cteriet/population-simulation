@@ -184,8 +184,12 @@ class SparkFeaturePreprocessor:
         
         # 3. Apply categorical encoding using efficient map lookups
         for col_name, state in self.categorical_maps.items():
-            # Create a PySpark map literal from the Python dictionary
-            mapping_expr = F.create_map([F.lit(x) for x in state['mapping'].items()])
+            # Flatten the dictionary into a list of [key1, value1, key2, value2, ...]
+            # This is the correct, robust way to pass arguments to F.create_map.
+            flat_map_items = [item for sublist in state['mapping'].items() for item in sublist]
+            
+            # Create a map expression from the flattened list of literals
+            mapping_expr = F.create_map(*[F.lit(x) for x in flat_map_items])
             
             # Apply the mapping
             transformed_df = transformed_df.withColumn(
