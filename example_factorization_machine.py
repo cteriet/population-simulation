@@ -61,7 +61,14 @@ class FactorizationMachine(nn.Module):
     Factorization Machine model implemented in PyTorch.
     This version is made safer by explicitly passing the banner field index.
     """
-    def __init__(self, n_numeric_features, categorical_field_dims, embed_dim, banner_field_idx, dropout_rate=0.1):
+    def __init__(self, 
+                 n_numeric_features: int, 
+                 categorical_field_dims: List[int], 
+                 embed_dim: int, 
+                 banner_field_idx: int, 
+                 dropout_rate: float = 0.1,
+                 initial_bias: torch.tensor = torch.tensor((0.,))
+                ):
         super().__init__()
         self.n_numeric_features = n_numeric_features
         self.categorical_field_dims = categorical_field_dims
@@ -82,26 +89,26 @@ class FactorizationMachine(nn.Module):
         if self.n_numeric_features > 0:
             self.interaction_numeric_vectors = nn.Parameter(torch.randn(n_numeric_features, embed_dim))
 
-        self.bias = nn.Parameter(torch.zeros((1,)))
+        self.bias = nn.Parameter(initial_bias)
         self.dropout = nn.Dropout(dropout_rate)
 
     def forward(self, x_numeric, x_categorical):
         linear_terms = self.bias
         cat_linear_terms = [emb(x_categorical[:, i]) for i, emb in enumerate(self.embeddings)]
-        linear_terms += torch.sum(torch.cat(cat_linear_terms, dim=1), dim=1, keepdim=True)
-
-        if self.n_numeric_features > 0:
-            linear_terms += self.linear_numeric(x_numeric)
+        linear_terms = linear_terms + torch.sum(torch.cat(cat_linear_terms, dim=1), dim=1, keepdim=True)
 
         cat_interaction_vectors = [emb(x_categorical[:, i]) for i, emb in enumerate(self.interaction_embeddings)]
+
+        stacked_cat_vector = torch.stack(cat_interaction_vectors, dim=1)
         
         if self.n_numeric_features > 0:
             numeric_interaction_vectors = x_numeric.unsqueeze(2) * self.interaction_numeric_vectors.unsqueeze(0)
-            all_vectors = torch.cat(cat_interaction_vectors + [numeric_interaction_vectors], dim=1)
+            all_vectors = torch.cat([stacked_cat_vector, numeric_interaction_vectors], dim=1)
         else:
-            all_vectors = torch.cat(cat_interaction_vectors, dim=1)
+            all_vectors = torch.cat(stacked_cat_vector, dim=1)
             
         all_vectors = self.dropout(all_vectors)
+        
         sum_of_squares = torch.sum(all_vectors, dim=1).pow(2)
         square_of_sums = torch.sum(all_vectors.pow(2), dim=1)
         interaction_terms = 0.5 * torch.sum(sum_of_squares - square_of_sums, dim=1, keepdim=True)
