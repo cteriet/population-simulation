@@ -290,3 +290,87 @@ trainer = pl.Trainer(
 trainer.fit(final_model, train_loader, val_loader)
 
 print(f"Best model saved at: {checkpoint_callback.best_model_path}")
+
+# ----
+
+
+from pytorch_lightning.callbacks import BaseFinetuning
+
+class BiasWarmupCallback(BaseFinetuning):
+    def __init__(self, unfreeze_at_epoch=1):
+        super().__init__()
+        self._unfreeze_at_epoch = unfreeze_at_epoch
+
+    def freeze_before_training(self, pl_module):
+        # Freeze everything initially
+        self.freeze(pl_module)
+        
+        # Unfreeze ONLY the bias and linear terms (if you want linear terms to help with baseline)
+        # Assuming your model has a 'bias' parameter and potentially 'linear_numeric'
+        if hasattr(pl_module, 'bias'):
+            self.make_trainable(pl_module.bias)
+            print("❄️ BiasWarmup: Embeddings frozen. Training only Bias.")
+        
+        # Optional: You might want to train the linear numeric weights too 
+        # if they represent simple features like 'hour of day'
+        if hasattr(pl_module, 'linear_numeric'):
+            self.make_trainable(pl_module.linear_numeric)
+
+    def finetune_function(self, pl_module, current_epoch, optimizer):
+        # When the warmup epoch is reached, unfreeze everything
+        if current_epoch == self._unfreeze_at_epoch:
+            self.unfreeze_and_add_param_group(
+                modules=pl_module,
+                optimizer=optimizer,
+                train_bn=True,
+            )
+            print(f"🔥 BiasWarmup: Warmup complete. Unfreezing all layers at epoch {current_epoch}.")
+
+# ----
+# Calculate the log odds from your training data
+# p = positive_samples / total_samples
+# initial_bias = np.log(p / (1 - p))
+
+warmup_callback = BiasWarmupCallback(unfreeze_at_epoch=1)
+
+trainer = pl.Trainer(
+    callbacks=[checkpoint_callback, early_stop_callback, warmup_callback],
+    max_epochs=50,
+    # ... other settings
+)
+
+trainer.fit(model, train_loader, val_loader)
+
+
+# --------------
+
+import torch
+import numpy as np
+import pandas as pd
+
+def calculate_initial_bias(df: pd.DataFrame, target_col: str) -> float:
+    """
+    Calculates the initial bias (log odds) for a binary target.
+    Formula: ln(p / (1 - p))
+    
+    Args:
+        df: The training dataframe.
+        target_col: The name of the binary target column.
+        
+    Returns:
+        float: The initial bias value to pass to the model.
+    """
+    # 1. Calculate probability p
+    # Note: If you are using IPW (weights), strictly speaking, you *could* # calculate the weighted mean here. However, for stability, the raw 
+    # mean is usually safer as a starting point for the bias.
+    p = df[target_col].mean()
+    
+    # 2. Clamp probabilities to avoid log(0) -> -inf or log(1) -> inf
+    # We restrict p to be between 1e-6 and (1 - 1e-6)
+    p = np.clip(p, 1e-6, 1.0 - 1e-6)
+    
+    # 3. Calculate Log Odds (logit function)
+    # log(p / (1 - p))
+    initial_bias = np.log(p / (1.0 - p))
+    
+    return float(initial_bias)
