@@ -1,0 +1,538 @@
+#model.py
+#=========
+
+import torch
+import torch.nn as nn
+from typing import List, Tuple, Dict, Any
+from torchmetrics import MetricCollection
+from torchmetrics.classification import BinaryAUROC, BinaryAccuracy
+from torchmetrics.regression import MeanSquaredError, MeanAbsoluteError
+from composer.models import ComposerModel
+
+class FactorizationMachine(nn.Module):
+    """
+    Pure PyTorch implementation of a Factorization Machine.
+    Decoupled from training logic.
+    """
+    def __init__(self,
+                 n_numeric_features: int,
+                 categorical_field_dims: List[int],
+                 embed_dim: int,
+                 dropout_rate: float = 0.1,
+                 initial_bias: float = 0.0):
+        super().__init__()
+        
+        self.n_numeric_features = n_numeric_features
+        
+        # 1. Linear Part
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(num, 1) for num in categorical_field_dims
+        ])
+        if self.n_numeric_features > 0:
+            self.linear_numeric = nn.Linear(self.n_numeric_features, 1)
+
+        # 2. Interaction Part
+        self.interaction_embeddings = nn.ModuleList([
+            nn.Embedding(num, embed_dim) for num in categorical_field_dims
+        ])
+        if self.n_numeric_features > 0:
+            self.interaction_numeric_vectors = nn.Parameter(torch.randn(n_numeric_features, embed_dim))
+
+        # Bias and Dropout
+        self.bias = nn.Parameter(torch.tensor([initial_bias]))
+        self.dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, x_numeric: torch.Tensor, x_categorical: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+        Returns logits (unnormalized scores).
+        """
+        # --- Linear Terms ---
+        linear_terms = self.bias
+        cat_linear_terms = [emb(x_categorical[:, i]) for i, emb in enumerate(self.embeddings)]
+        
+        # Sum categorical linear embeddings
+        # shape: (batch_size, num_cat_features, 1) -> sum -> (batch_size, 1)
+        linear_terms = linear_terms + torch.sum(torch.cat(cat_linear_terms, dim=1), dim=1, keepdim=True)
+        
+        if self.n_numeric_features > 0:
+            linear_terms = linear_terms + self.linear_numeric(x_numeric)
+
+        # --- Interaction Terms ---
+        # 1. Stack categorical embeddings
+        cat_interaction_vectors = [emb(x_categorical[:, i]) for i, emb in enumerate(self.interaction_embeddings)]
+        stacked_cat_vector = torch.stack(cat_interaction_vectors, dim=1) # (Batch, Num_Cats, Embed_Dim)
+        
+        # 2. Add numeric interaction vectors if they exist
+        if self.n_numeric_features > 0:
+            # Broadcast numeric input against interaction vectors
+            # x_numeric: (Batch, Num_Num) -> (Batch, Num_Num, 1)
+            # vectors: (Num_Num, Embed) -> (1, Num_Num, Embed)
+            numeric_interaction_vectors = x_numeric.unsqueeze(2) * self.interaction_numeric_vectors.unsqueeze(0)
+            all_vectors = torch.cat([stacked_cat_vector, numeric_interaction_vectors], dim=1)
+        else:
+            all_vectors = stacked_cat_vector
+            
+        all_vectors = self.dropout(all_vectors)
+        
+        # FM Interaction equation: $$ 0.5 * (\sum(v)^2 - \sum(v^2)) $$
+        sum_of_squares = torch.sum(all_vectors, dim=1).pow(2)
+        square_of_sums = torch.sum(all_vectors.pow(2), dim=1)
+        interaction_terms = 0.5 * torch.sum(sum_of_squares - square_of_sums, dim=1, keepdim=True)
+
+        logits = linear_terms + interaction_terms
+        return logits.squeeze(1)
+
+
+class ComposerFM(ComposerModel):
+    """
+    MosaicML Composer Wrapper for the Factorization Machine.
+    Handles loss calculation and metrics.
+    """
+    def __init__(self, 
+                 model: FactorizationMachine, 
+                 target_type: str = "binary", 
+                 pos_weight: float = 1.0,
+                 background_ctr: float = 0.02):
+        super().__init__()
+        self.model = model
+        self.target_type = target_type
+        self.background_ctr = background_ctr
+        
+        # Define Metrics
+        if target_type == "binary":
+            self.train_metrics = MetricCollection([BinaryAUROC(), BinaryAccuracy()])
+            self.val_metrics = MetricCollection([BinaryAUROC(), BinaryAccuracy()])
+            
+            p_weight = torch.tensor([pos_weight]) if pos_weight != 1.0 else None
+            self.criterion = nn.BCEWithLogitsLoss(reduction='none', pos_weight=p_weight)
+            
+            # Pre-calculate background entropy for Normalized Entropy (NE) metric
+            p = max(min(background_ctr, 1-1e-7), 1e-7)
+            self.background_entropy = -(p * torch.log(torch.tensor(p)) + (1 - p) * torch.log(torch.tensor(1 - p)))
+            
+        elif target_type == "continuous":
+            self.train_metrics = MetricCollection([MeanSquaredError(), MeanAbsoluteError()])
+            self.val_metrics = MetricCollection([MeanSquaredError(), MeanAbsoluteError()])
+            self.criterion = nn.MSELoss(reduction='none')
+        else:
+            raise ValueError(f"Unknown target_type: {target_type}")
+
+    def forward(self, batch):
+        # Composer passes the whole batch to forward usually, but we can unpack here
+        # depending on how the dataloader yields data.
+        # Assuming batch is (x_num, x_cat, y, weights)
+        x_num, x_cat, _, _ = batch
+        return self.model(x_num, x_cat)
+
+    def loss(self, outputs, batch):
+        _, _, y, weights = batch
+        
+        # outputs are logits from forward()
+        raw_loss = self.criterion(outputs, y)
+        
+        # Apply IPW (Inverse Propensity Weights)
+        weighted_loss = (raw_loss * weights).mean()
+        return weighted_loss
+
+    def get_metrics(self, is_train: bool = False):
+        return self.train_metrics if is_train else self.val_metrics
+
+    def update_metric(self, batch, outputs, metric):
+        _, _, y, _ = batch
+        metric.update(outputs, y)
+		
+#callback.py
+#=========
+
+import torch
+from composer import Callback, State, Logger
+from composer.core import Event
+from factorization_machines.utils import logger
+
+logger = logger.get_logger()
+
+class BiasWarmupCallback(Callback):
+    """
+    Freezes all model parameters except the bias and linear terms 
+    until the specified epoch is reached.
+    """
+    def __init__(self, unfreeze_at_epoch: int = 1):
+        self.unfreeze_at_epoch = unfreeze_at_epoch
+        self.is_frozen = False
+
+    def _freeze_embeddings(self, state: State):
+        """Helper to freeze everything except bias/linear"""
+        # Access the underlying PyTorch module (unwrap from ComposerModel)
+        model = state.model.module if hasattr(state.model, 'module') else state.model.model
+        
+        # Turn off gradients for everything first
+        for param in model.parameters():
+            param.requires_grad = False
+            
+        # Unfreeze Bias
+        if hasattr(model, 'bias'):
+            model.bias.requires_grad = True
+            
+        # Unfreeze Linear Numeric (optional, usually good to keep)
+        if hasattr(model, 'linear_numeric'):
+            for param in model.linear_numeric.parameters():
+                param.requires_grad = True
+                
+        logger.info("BiasWarmup: Embeddings frozen. Training only Bias/Linear terms.")
+        self.is_frozen = True
+
+    def _unfreeze_all(self, state: State):
+        """Helper to unfreeze all parameters"""
+        model = state.model.module if hasattr(state.model, 'module') else state.model.model
+        
+        for param in model.parameters():
+            param.requires_grad = True
+            
+        logger.info(f"BiasWarmup: Warmup complete. Unfreezing all layers.")
+        self.is_frozen = False
+
+    def fit_start(self, state: State, logger: Logger):
+        """Called at the very beginning of training"""
+        if self.unfreeze_at_epoch > 0:
+            self._freeze_embeddings(state)
+
+    def epoch_start(self, state: State, logger: Logger):
+        """Called at the start of every epoch"""
+        # state.timestamp.epoch is a Time object, we cast to int
+        current_epoch = int(state.timestamp.epoch)
+        
+        if self.is_frozen and current_epoch >= self.unfreeze_at_epoch:
+            self._unfreeze_all(state)
+			
+# tuning.py
+# ==============
+
+import os
+import optuna
+import mlflow
+import torch.optim as optim
+from torch.utils.data import DataLoader
+
+# Composer Imports
+from composer import Trainer, Callback, State, Logger
+from composer.loggers import MLFlowLogger
+from composer.utils import reproduction_logging
+from factorization_machines.model.factorization_machine import FactorizationMachine, ComposerFM
+from factorization_machines.model.callbacks import BiasWarmupCallback
+from factorization_machines.utils import logger
+
+logger = logger.get_logger()
+
+class OptunaPruningCallback(Callback):
+    """
+    Custom Composer Callback to report metrics to Optuna and prune trials.
+    """
+    def __init__(self, trial: optuna.trial.Trial, monitor: str = "BinaryAUROC"):
+        self.trial = trial
+        self.monitor = monitor
+
+    def eval_end(self, state: State, logger: Logger):
+        """Called after validation loop ends"""
+        # Extract metric from state
+        # Metrics are usually stored as 'BinaryAUROC' or 'val/BinaryAUROC'
+        # Composer stores current metrics in state.eval_metrics
+        
+        # Find the metric in the dictionary
+        metric_value = None
+        for k, v in state.eval_metrics.items():
+            if self.monitor in k:
+                # v is a Metric object, we need .compute() or simply the value if it's already computed
+                metric_value = v.item() if hasattr(v, 'item') else v
+                break
+        
+        if metric_value is not None:
+            # Report to Optuna (epoch is state.timestamp.epoch)
+            epoch = int(state.timestamp.epoch)
+            self.trial.report(metric_value, step=epoch)
+
+            if self.trial.should_prune():
+                raise optuna.TrialPruned()
+
+def objective(trial: optuna.trial.Trial, 
+              train_loader: DataLoader, 
+              val_loader: DataLoader, 
+              config: dict):
+    
+    # 1. Suggest Hyperparameters
+    embed_dim = trial.suggest_categorical('embed_dim', [8, 16, 32, 64])
+    lr = trial.suggest_float('lr', 1e-4, 1e-2, log=True)
+    dropout_rate = trial.suggest_float('dropout_rate', 0.1, 0.5)
+    weight_decay = trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
+
+    # 2. Build Pure PyTorch Model
+    torch_model = FactorizationMachine(
+        n_numeric_features=config['n_numeric'],
+        categorical_field_dims=config['cat_dims'],
+        embed_dim=embed_dim,
+        dropout_rate=dropout_rate,
+        initial_bias=config['initial_bias']
+    )
+
+    # 3. Wrap in Composer Model
+    composer_model = ComposerFM(
+        model=torch_model,
+        target_type=config['target_type'],
+        pos_weight=config.get('pos_weight', 1.0)
+    )
+
+    # 4. Optimizer
+    # In Composer, we pass the optimizer Class and kwargs, not the instance
+    optimizer_cls = optim.Adam
+    optimizer_kwargs = {'lr': lr, 'weight_decay': weight_decay}
+
+    # 5. Initialize Trainer
+    # We disable checkpointing/logging to disk for speed during tuning
+    trainer = Trainer(
+        model=composer_model,
+        train_dataloader=train_loader,
+        eval_dataloader=val_loader,
+        optimizers=optimizer_cls,
+        optimizer_kwargs=optimizer_kwargs,
+        max_duration="5ep", # Composer string format for epochs
+        device="auto",
+        
+        # Callbacks
+        callbacks=[
+            BiasWarmupCallback(unfreeze_at_epoch=1),
+            OptunaPruningCallback(trial, monitor="BinaryAUROC") # Prune based on AUC
+        ],
+        
+        # Optimization: Only check subset of data for speed
+        eval_subset_num_batches=0.2, 
+        
+        # Disable progress bars and heavy logging
+        progress_bar=False,
+        log_to_console=False
+    )
+
+    # 6. Train
+    trainer.fit()
+
+    # 7. Return Metric (Minimize or Maximize depends on study direction)
+    # Here we assume we want to MAXIMIZE AUC.
+    # We need to access the final metric from the evaluator
+    
+    final_metrics = trainer.state.eval_metrics
+    # Handle key naming (Composer adds 'val/' prefix often)
+    auc = final_metrics.get('BinaryAUROC', final_metrics.get('val/BinaryAUROC'))
+    
+    return auc.item() if hasattr(auc, 'item') else auc
+
+
+def tune_hyperparameters(n_trials, train_loader, val_loader, config):
+    logger.info(f"--- Starting Tuning ({n_trials} trials) ---")
+    
+    # Note: Using maximize for AUC
+    study = optuna.create_study(direction="maximize", pruner=optuna.pruners.MedianPruner())
+    
+    study.optimize(
+        lambda trial: objective(trial, train_loader, val_loader, config), 
+        n_trials=n_trials
+    )
+
+    logger.info(f"Best params: {study.best_params}")
+    return study
+	
+# train.py
+# =============
+
+import os
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import mlflow
+
+# MosaicML Composer
+from composer import Trainer
+from composer.loggers import MLFlowLogger
+from composer.callbacks import CheckpointSaver, EarlyStopper
+
+# Local imports
+from factorization_machines.data.factorization_dataset import PandasDataset
+from factorization_machines.model.factorization_machine import FactorizationMachine, ComposerFM, calculate_initial_bias
+from factorization_machines.model.callbacks import BiasWarmupCallback
+from factorization_machines.optimization.tuning import tune_hyperparameters
+from factorization_machines.transformers.base_spark_transformer_utils import create_encoder, create_preprocessor, save_spark_transformer
+from factorization_machines.config import conf
+from factorization_machines.utils import logger
+from factorization_machines.utils.etl_utils import get_spark_session
+from sklearn.model_selection import train_test_split
+from factorization_machines.data.io import read_training_data
+
+logger = logger.get_logger()
+spark = get_spark_session()
+
+def create_best_model(config: dict, best_params: dict, train_loader: DataLoader, val_loader: DataLoader):
+    
+    # 1. Define Paths (using Databricks Volume from config)
+    # Composer CheckpointSaver expects a generic folder string.
+    # If this is a mounted volume, the path works as a local path.
+    checkpoint_save_folder = f"{conf.databricks_volume}/checkpoints/{conf.experiment_name}"
+    
+    logger.info(f"Checkpoints will be saved to: {checkpoint_save_folder}")
+
+    # 2. Instantiate Pure PyTorch Model
+    torch_model = FactorizationMachine(
+        n_numeric_features=config['n_numeric'],
+        categorical_field_dims=config['cat_dims'],
+        embed_dim=best_params['embed_dim'],
+        dropout_rate=best_params['dropout_rate'],
+        initial_bias=config['initial_bias']
+    )
+
+    # 3. Instantiate Composer Model Wrapper
+    composer_model = ComposerFM(
+        model=torch_model,
+        target_type=config['target_type'],
+        pos_weight=config.get('pos_weight', 1.0)
+    )
+
+    # 4. Set up Loggers
+    # Composer handles MLflow logging natively
+    mlflow_logger = MLFlowLogger(
+        experiment_name=conf.experiment_name,
+        tracking_uri=conf.registry_uri,
+        tags={
+            "mlflow.source.git.commit": os.getenv("GIT_COMMIT", "run"),
+            "framework": "mosaicml-composer"
+        }
+    )
+
+    # 5. Set up Callbacks
+    # CheckpointSaver: Saves state to disk/volume
+    checkpoint_saver = CheckpointSaver(
+        folder=checkpoint_save_folder,
+        save_interval="1ep", # Save every epoch
+        overwrite=True,      # Keep only latest (or configure to keep n)
+        num_checkpoints_to_keep=1
+    )
+
+    early_stopper = EarlyStopper(
+        monitor="val/BinaryAUROC", # Monitor AUC
+        patience=3,                # Stop after 3 epochs of no improvement
+        comp_metric_fn=lambda current, best: current < best # Note: logic depends on metric. 
+        # Actually, for AUC we want MAX. EarlyStopper defaults to assuming min.
+        # So we need to ensure we configure it correctly or use Loss.
+        # Let's use val_loss for safety as it is standard to minimize.
+    )
+    # Re-defining for Loss to be safe (minimized)
+    early_stopper = EarlyStopper(monitor="val/Loss", patience=3)
+
+    warmup_callback = BiasWarmupCallback(unfreeze_at_epoch=1)
+
+    # 6. Initialize Trainer
+    trainer = Trainer(
+        model=composer_model,
+        train_dataloader=train_loader,
+        eval_dataloader=val_loader,
+        
+        # Optimizer
+        optimizers=optim.Adam,
+        optimizer_kwargs={
+            'lr': best_params['lr'], 
+            'weight_decay': best_params['weight_decay']
+        },
+        
+        # Training Duration
+        max_duration="10ep",
+        
+        # Devices
+        device="auto", # auto-detects GPU
+        
+        # Callbacks & Loggers
+        callbacks=[checkpoint_saver, early_stopper, warmup_callback],
+        loggers=[mlflow_logger],
+        
+        # Name for the run
+        run_name=f"{conf.use_case}_BestModel"
+    )
+
+    # 7. Train
+    logger.info("Starting Composer Training...")
+    trainer.fit()
+    
+    # 8. Log Final Model to MLflow Model Registry
+    # While MLFlowLogger tracks metrics, we explicitly want to register the "best" model artifact
+    # Composer can save the model to a local file, which we then log.
+    
+    local_save_path = "final_model_artifact.pt"
+    torch.save(torch_model.state_dict(), local_save_path)
+    
+    with mlflow.start_run(run_id=mlflow_logger.run_id):
+        mlflow.pytorch.log_model(
+            pytorch_model=torch_model,
+            artifact_path="model",
+            registered_model_name=conf.mlflow_model_name
+        )
+        logger.info(f"Model registered to MLflow as {conf.mlflow_model_name}")
+
+    # Cleanup checkpoints if desired (or rely on num_checkpoints_to_keep=1)
+    
+def get_full_train_data_and_encoders(spark, conf):
+    # (Implementation remains the same as provided in your snippet)
+    input_df = read_training_data(spark, table_path=conf.train_table_path, sample_fraction=conf.training_sample_fraction, seed=conf.training_sampling_seed)
+    preprocessor, preprocessed_df = create_preprocessor(conf, input_df)
+    encoder, encoded_df = create_encoder(conf, preprocessed_df)
+    return input_df, encoded_df
+
+def train_model() -> None:
+    # Constants
+    NUMERICAL_COLUMNS = conf.model_columns["numerical"]
+    CATEGORICAL_COLUMNS = conf.model_columns["binary"] + conf.model_columns["categorical"] + [conf.banner_column]
+    BANNER_COLUMN = conf.banner_column
+    TARGET_COLUMN = conf.target_column
+
+    logger.info("Preparing data...")
+    input_df, processed_df = get_full_train_data_and_encoders(spark, conf)
+    
+    # Convert to Pandas for Development (Requirement 8)
+    df = processed_df.toPandas()
+    input_df.unpersist()
+
+    train_df, val_df = train_test_split(df, test_size=0.2, random_state=42, stratify=df[TARGET_COLUMN])
+    train_df["ipw"] = 1.0 # Placeholder for IPW logic
+    val_df["ipw"] = 1.0
+
+    # Calculate Bias (Requirement 2)
+    # Even with warmup, a good initial bias speeds up the first epoch significantly
+    initial_bias = calculate_initial_bias(train_df, target_column=conf.target_column)
+
+    # Config
+    n_numeric = len(NUMERICAL_COLUMNS)
+    categorical_field_dims = [train_df[col].nunique() for col in CATEGORICAL_COLUMNS]
+    
+    # Setup Datasets
+    # Note: PandasDataset needs to handle the fact that banner_idx logic might need adjustment based on how the list is ordered
+    # Assuming PandasDataset logic is robust:
+    train_dataset = PandasDataset(train_df, CATEGORICAL_COLUMNS, NUMERICAL_COLUMNS, TARGET_COLUMN, 'ipw')
+    val_dataset = PandasDataset(val_df, CATEGORICAL_COLUMNS, NUMERICAL_COLUMNS, TARGET_COLUMN, 'ipw')
+
+    train_loader = DataLoader(train_dataset, batch_size=1024, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=1024, shuffle=False, num_workers=4)
+    
+    # Configuration dict passed to objective/model
+    config_dict = {
+        'n_numeric': n_numeric,
+        'cat_dims': categorical_field_dims,
+        'target_type': 'binary',
+        'initial_bias': initial_bias,
+        'pos_weight': 1.0
+    }
+
+    # Requirement 4 & 5: Scan for Hyperparameters
+    logger.info("\n--- Scanning for Best Hyperparameters with Optuna ---")
+    study = tune_hyperparameters(n_trials=5, train_loader=train_loader, val_loader=val_loader, config=config_dict)
+    best_params = study.best_params
+    
+    # Requirement 6 & 7: Train Final Model and Log
+    logger.info("\n--- Training Final Model with Best Hyperparameters ---")
+    create_best_model(config_dict, best_params, train_loader, val_loader)
+
+if __name__ == "__main__":
+    train_model()
